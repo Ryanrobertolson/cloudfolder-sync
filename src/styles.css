@@ -172,6 +172,57 @@ nav {
   line-height: 1.45;
 }
 
+.support-link {
+  display: grid;
+  grid-template-columns: 28px 1fr auto;
+  align-items: center;
+  gap: 9px;
+  width: 100%;
+  margin-top: 10px;
+  padding: 10px;
+  border: 1px solid #5a4842;
+  border-radius: 10px;
+  color: #f8ece8;
+  background: #342922;
+  text-align: left;
+}
+
+.support-link:hover {
+  border-color: #986b61;
+  background: #443129;
+}
+
+.support-link > span {
+  display: grid;
+  place-items: center;
+  width: 27px;
+  height: 27px;
+  border-radius: 8px;
+  color: #fff;
+  background: #d45f58;
+  font-size: 12px;
+}
+
+.support-link strong,
+.support-link small {
+  display: block;
+}
+
+.support-link strong {
+  font-size: 10px;
+}
+
+.support-link small {
+  margin-top: 2px;
+  color: #bda9a1;
+  font-size: 8px;
+}
+
+.support-link > b {
+  color: #bda9a1;
+  font-size: 11px;
+}
+
 .quit-link {
   margin-top: 12px;
   padding: 8px;
@@ -1023,6 +1074,64 @@ fieldset {
   font-weight: 800;
 }
 
+.selected-source-list {
+  display: grid;
+  gap: 5px;
+  max-height: 145px;
+  overflow-y: auto;
+  margin-top: 7px;
+}
+
+.selected-source-list > div {
+  display: grid;
+  grid-template-columns: 24px minmax(0, 1fr) 24px;
+  align-items: center;
+  gap: 7px;
+  padding: 7px 9px;
+  border: 1px solid #e1e4de;
+  border-radius: 7px;
+  background: #f7f8f5;
+}
+
+.selected-source-list span {
+  color: #d19a39;
+  font-size: 18px;
+}
+
+.selected-source-list strong {
+  overflow: hidden;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 9px;
+  font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.selected-source-list button {
+  display: grid;
+  place-items: center;
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  border: 0;
+  border-radius: 50%;
+  color: #7b847d;
+  background: #e8ebe6;
+  font-size: 15px;
+}
+
+.selected-source-list button:hover {
+  color: #fff;
+  background: var(--danger);
+}
+
+.multi-source-note {
+  margin: 8px 2px 0;
+  color: #617369;
+  font-size: 9px;
+  line-height: 1.45;
+}
+
 .form-row {
   display: grid;
   grid-template-columns: 1fr 1.5fr;
@@ -1406,6 +1515,16 @@ nav.folder-breadcrumbs {
   margin: 0;
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
   font-size: 10px;
+}
+
+.job-details dd.detail-source-list {
+  display: grid;
+  gap: 5px;
+}
+
+.detail-source-list span {
+  display: block;
+  overflow-wrap: anywhere;
 }
 
 .run-list {

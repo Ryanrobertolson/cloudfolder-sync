@@ -13,7 +13,7 @@ type CloudSetupStatus =
 interface SyncJob {
   id: number;
   name: string;
-  source_path: string;
+  source_paths: string[];
   destination: string;
   interval_minutes: number;
   enabled: boolean;
@@ -35,7 +35,7 @@ interface RunRecord {
 
 interface JobDraft {
   name: string;
-  source_path: string;
+  source_paths: string[];
   remote: string;
   cloud_path: string | null;
   interval_minutes: number;
@@ -48,7 +48,7 @@ interface CloudFolderEntry {
 
 const initialDraft: JobDraft = {
   name: "",
-  source_path: "",
+  source_paths: [],
   remote: "",
   cloud_path: null,
   interval_minutes: 60,
@@ -76,6 +76,12 @@ function formatInterval(minutes: number): string {
 function shortPath(path: string): string {
   if (path.length <= 46) return path;
   return `…${path.slice(-45)}`;
+}
+
+function sourceSummary(paths: string[]): string {
+  if (paths.length === 0) return "No files or folders selected";
+  if (paths.length === 1) return shortPath(paths[0]);
+  return `${paths.length} files and folders`;
 }
 
 export default function App() {
@@ -135,13 +141,25 @@ export default function App() {
   );
 
   async function chooseSource(directory: boolean) {
-    const selected = await open({ directory, multiple: false });
-    if (typeof selected !== "string") return;
-    const fallbackName = selected.split("/").filter(Boolean).pop() ?? "My backup";
+    const selected = await open({ directory, multiple: true });
+    if (!selected) return;
+    const additions = Array.isArray(selected) ? selected : [selected];
+    if (additions.length === 0) return;
     setDraft((current) => ({
       ...current,
-      source_path: selected,
-      name: current.name || fallbackName,
+      source_paths: Array.from(
+        new Set([...current.source_paths, ...additions]),
+      ),
+      name:
+        current.name ||
+        (additions[0].split("/").filter(Boolean).pop() ?? "My backup"),
+    }));
+  }
+
+  function removeSource(path: string) {
+    setDraft((current) => ({
+      ...current,
+      source_paths: current.source_paths.filter((source) => source !== path),
     }));
   }
 
@@ -154,7 +172,7 @@ export default function App() {
       await invoke<SyncJob>("create_job", {
         input: {
           name: draft.name,
-          source_path: draft.source_path,
+          source_paths: draft.source_paths,
           destination: `${draft.remote}${cleanCloudPath}`,
           interval_minutes: Number(draft.interval_minutes),
         },
@@ -315,6 +333,14 @@ export default function App() {
     }
   }
 
+  async function openSupportPage() {
+    try {
+      await invoke("open_support_page");
+    } catch (reason) {
+      setError(String(reason));
+    }
+  }
+
   return (
     <div className="app-shell">
       <aside className="sidebar">
@@ -346,6 +372,15 @@ export default function App() {
             <p>Cloud files are never automatically deleted.</p>
           </div>
         </div>
+
+        <button className="support-link" onClick={() => void openSupportPage()}>
+          <span aria-hidden="true">♥</span>
+          <div>
+            <strong>Support CloudFolder</strong>
+            <small>Visit Ryan’s Ko-fi page</small>
+          </div>
+          <b aria-hidden="true">↗</b>
+        </button>
 
         <button className="quit-link" onClick={() => void invoke("quit_app")}>
           Quit CloudFolder
@@ -461,7 +496,9 @@ export default function App() {
                             {isRunning ? "Running" : job.status}
                           </span>
                         </div>
-                        <p title={job.source_path}>{shortPath(job.source_path)}</p>
+                        <p title={job.source_paths.join("\n")}>
+                          {sourceSummary(job.source_paths)}
+                        </p>
                         <div className="job-meta">
                           <span>☁ {job.destination}</span>
                           <span>◷ {formatInterval(job.interval_minutes)}</span>
@@ -686,22 +723,41 @@ export default function App() {
 
               <fieldset>
                 <legend>What should be backed up?</legend>
-                <div className="source-picker">
+                <div className="source-picker multi-source-picker">
                   <div>
-                    <strong>
-                      {draft.source_path
-                        ? shortPath(draft.source_path)
-                        : "No source selected"}
-                    </strong>
-                    <small>Choose one file or an entire folder</small>
+                    <strong>{sourceSummary(draft.source_paths)}</strong>
+                    <small>Add as many as you need, up to 50</small>
                   </div>
                   <button type="button" onClick={() => void chooseSource(false)}>
-                    Choose file
+                    ＋ Add files
                   </button>
                   <button type="button" onClick={() => void chooseSource(true)}>
-                    Choose folder
+                    ＋ Add folders
                   </button>
                 </div>
+                {draft.source_paths.length > 0 && (
+                  <div className="selected-source-list">
+                    {draft.source_paths.map((path) => (
+                      <div key={path}>
+                        <span aria-hidden="true">▰</span>
+                        <strong title={path}>{shortPath(path)}</strong>
+                        <button
+                          type="button"
+                          aria-label={`Remove ${path}`}
+                          onClick={() => removeSource(path)}
+                        >
+                          ×
+                        </button>
+                      </div>
+                    ))}
+                  </div>
+                )}
+                {draft.source_paths.length > 1 && (
+                  <p className="multi-source-note">
+                    Each item gets its own named folder in Google Drive, so files
+                    cannot overwrite each other.
+                  </p>
+                )}
               </fieldset>
 
               <div className="form-row">
@@ -793,7 +849,7 @@ export default function App() {
                   className="primary"
                   disabled={
                     saving ||
-                    !draft.source_path ||
+                    draft.source_paths.length === 0 ||
                     !draft.remote ||
                     draft.cloud_path === null ||
                     !draft.name.trim()
@@ -977,8 +1033,12 @@ export default function App() {
             <h2>{selectedJob.name}</h2>
             <dl className="job-details">
               <div>
-                <dt>Source</dt>
-                <dd>{selectedJob.source_path}</dd>
+                <dt>Sources</dt>
+                <dd className="detail-source-list">
+                  {selectedJob.source_paths.map((path) => (
+                    <span key={path}>{path}</span>
+                  ))}
+                </dd>
               </div>
               <div>
                 <dt>Destination</dt>

@@ -48,7 +48,7 @@ type AppResult<T> = Result<T, AppError>;
 struct SyncJob {
     id: i64,
     name: String,
-    source_path: String,
+    source_paths: Vec<String>,
     destination: String,
     interval_minutes: i64,
     enabled: bool,
@@ -62,7 +62,7 @@ struct SyncJob {
 #[derive(Debug, Deserialize)]
 struct NewJob {
     name: String,
-    source_path: String,
+    source_paths: Vec<String>,
     destination: String,
     interval_minutes: i64,
 }
@@ -148,10 +148,11 @@ fn initialize_database(path: &Path) -> AppResult<()> {
 }
 
 fn map_job(row: &rusqlite::Row<'_>) -> rusqlite::Result<SyncJob> {
+    let stored_source: String = row.get(2)?;
     Ok(SyncJob {
         id: row.get(0)?,
         name: row.get(1)?,
-        source_path: row.get(2)?,
+        source_paths: decode_source_paths(&stored_source),
         destination: row.get(3)?,
         interval_minutes: row.get(4)?,
         enabled: row.get::<_, i64>(5)? != 0,
@@ -161,6 +162,13 @@ fn map_job(row: &rusqlite::Row<'_>) -> rusqlite::Result<SyncJob> {
         last_message: row.get(9)?,
         created_at: row.get(10)?,
     })
+}
+
+fn decode_source_paths(stored: &str) -> Vec<String> {
+    serde_json::from_str::<Vec<String>>(stored)
+        .ok()
+        .filter(|paths| !paths.is_empty())
+        .unwrap_or_else(|| vec![stored.to_owned()])
 }
 
 fn get_job(connection: &Connection, job_id: i64) -> AppResult<SyncJob> {
@@ -185,16 +193,50 @@ fn validate_new_job(input: &NewJob) -> AppResult<()> {
             "The schedule must be at least one minute".into(),
         ));
     }
-    let source = Path::new(&input.source_path);
-    if !source.is_absolute() {
+    if input.source_paths.is_empty() {
         return Err(AppError::Validation(
-            "The selected source must be an absolute path".into(),
+            "Choose at least one file or folder to back up".into(),
         ));
     }
-    if !source.exists() {
+    if input.source_paths.len() > 50 {
         return Err(AppError::Validation(
-            "The selected file or folder no longer exists".into(),
+            "A backup can contain up to 50 files and folders".into(),
         ));
+    }
+
+    let mut seen_paths = HashSet::new();
+    let mut seen_names = HashSet::new();
+    for source_path in &input.source_paths {
+        let source = Path::new(source_path);
+        if !source.is_absolute() {
+            return Err(AppError::Validation(format!(
+                "The selected source must be an absolute path: {source_path}"
+            )));
+        }
+        if !source.exists() {
+            return Err(AppError::Validation(format!(
+                "The selected file or folder no longer exists: {source_path}"
+            )));
+        }
+        if !seen_paths.insert(source_path) {
+            return Err(AppError::Validation(
+                "The same source was selected more than once".into(),
+            ));
+        }
+        if input.source_paths.len() > 1 {
+            let name = source.file_name().ok_or_else(|| {
+                AppError::Validation(
+                    "The file-system root cannot be combined with other sources".into(),
+                )
+            })?;
+            let folded_name = name.to_string_lossy().to_lowercase();
+            if !seen_names.insert(folded_name) {
+                return Err(AppError::Validation(
+                    "Two selected sources have the same name. Rename one or put it in a separate backup."
+                        .into(),
+                ));
+            }
+        }
     }
     if !input.destination.contains(':') {
         return Err(AppError::Validation(
@@ -224,6 +266,8 @@ fn create_job(input: NewJob, state: State<'_, AppState>) -> AppResult<SyncJob> {
     let connection = connect(&state.db_path)?;
     let created_at = now_string();
     let next_run = add_minutes(input.interval_minutes);
+    let stored_sources = serde_json::to_string(&input.source_paths)
+        .map_err(|error| AppError::Validation(format!("Could not save the sources: {error}")))?;
     connection.execute(
         "INSERT INTO jobs
             (name, source_path, destination, interval_minutes, enabled,
@@ -231,7 +275,7 @@ fn create_job(input: NewJob, state: State<'_, AppState>) -> AppResult<SyncJob> {
          VALUES (?1, ?2, ?3, ?4, 1, ?5, 'ready', ?6)",
         params![
             input.name.trim(),
-            input.source_path,
+            stored_sources,
             input.destination,
             input.interval_minutes,
             next_run,
@@ -310,31 +354,70 @@ fn compact_output(stdout: &[u8], stderr: &[u8]) -> String {
 }
 
 fn perform_copy(job: &SyncJob) -> AppResult<String> {
-    if !Path::new(&job.source_path).exists() {
-        return Err(AppError::Transfer(
-            "The source is unavailable. If it is on a removable drive, reconnect it and try again."
-                .into(),
-        ));
+    let multiple_sources = job.source_paths.len() > 1;
+    let mut completed = Vec::new();
+    let mut failures = Vec::new();
+
+    for source_path in &job.source_paths {
+        let source = Path::new(source_path);
+        let source_name = source
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| source_path.clone());
+        if !source.exists() {
+            failures.push(format!(
+                "{source_name}: source is unavailable; reconnect its drive and try again"
+            ));
+            continue;
+        }
+        let destination = if multiple_sources {
+            child_cloud_destination(&job.destination, &source_name)
+        } else {
+            job.destination.clone()
+        };
+        let output = Command::new("rclone")
+            .arg("copy")
+            .arg(source_path)
+            .arg(destination)
+            .arg("--create-empty-src-dirs")
+            .arg("--stats-one-line")
+            .arg("--stats=10s")
+            .arg("--retries=3")
+            .output()
+            .map_err(|error| {
+                AppError::Transfer(format!(
+                    "Could not start rclone: {error}. Install rclone and try again."
+                ))
+            })?;
+        let message = compact_output(&output.stdout, &output.stderr);
+        if output.status.success() {
+            completed.push(format!("{source_name}: {message}"));
+        } else {
+            failures.push(format!("{source_name}: {message}"));
+        }
     }
-    let output = Command::new("rclone")
-        .arg("copy")
-        .arg(&job.source_path)
-        .arg(&job.destination)
-        .arg("--create-empty-src-dirs")
-        .arg("--stats-one-line")
-        .arg("--stats=10s")
-        .arg("--retries=3")
-        .output()
-        .map_err(|error| {
-            AppError::Transfer(format!(
-                "Could not start rclone: {error}. Install rclone and try again."
-            ))
-        })?;
-    let message = compact_output(&output.stdout, &output.stderr);
-    if output.status.success() {
-        Ok(message)
+
+    if failures.is_empty() {
+        Ok(completed.join("\n"))
     } else {
-        Err(AppError::Transfer(message))
+        let partial_note = if completed.is_empty() {
+            String::new()
+        } else {
+            format!("{} source(s) completed. ", completed.len())
+        };
+        Err(AppError::Transfer(format!(
+            "{partial_note}{} source(s) failed:\n{}",
+            failures.len(),
+            failures.join("\n")
+        )))
+    }
+}
+
+fn child_cloud_destination(destination: &str, child_name: &str) -> String {
+    if destination.ends_with(':') || destination.ends_with('/') {
+        format!("{destination}{child_name}")
+    } else {
+        format!("{destination}/{child_name}")
     }
 }
 
@@ -704,6 +787,22 @@ fn open_rclone_config() -> AppResult<()> {
     ))
 }
 
+const SUPPORT_URL: &str = "https://ko-fi.com/ryanrobertolson";
+
+#[tauri::command]
+fn open_support_page() -> AppResult<()> {
+    Command::new("xdg-open")
+        .arg(SUPPORT_URL)
+        .spawn()
+        .map(|_| ())
+        .map_err(|error| {
+            AppError::Io(std::io::Error::new(
+                error.kind(),
+                format!("Could not open the Ko-fi page: {error}"),
+            ))
+        })
+}
+
 #[tauri::command]
 fn quit_app(app: AppHandle) {
     app.exit(0);
@@ -822,6 +921,7 @@ pub fn run() {
             list_cloud_folders,
             create_cloud_folder,
             open_rclone_config,
+            open_support_page,
             quit_app
         ])
         .run(tauri::generate_context!())
@@ -837,7 +937,7 @@ mod tests {
     fn rejects_relative_source_paths() {
         let input = NewJob {
             name: "Documents".into(),
-            source_path: "Documents".into(),
+            source_paths: vec!["Documents".into()],
             destination: "drive:Backups".into(),
             interval_minutes: 60,
         };
@@ -848,7 +948,7 @@ mod tests {
     fn rejects_destinations_without_a_remote() {
         let input = NewJob {
             name: "Documents".into(),
-            source_path: std::env::temp_dir().to_string_lossy().into_owned(),
+            source_paths: vec![std::env::temp_dir().to_string_lossy().into_owned()],
             destination: "Backups".into(),
             interval_minutes: 60,
         };
@@ -860,6 +960,18 @@ mod tests {
         assert_eq!(
             compact_output(b"", b""),
             "Backup completed; no files needed uploading"
+        );
+    }
+
+    #[test]
+    fn old_single_source_jobs_are_migrated_when_read() {
+        assert_eq!(
+            decode_source_paths("/home/ryan/Documents"),
+            vec!["/home/ryan/Documents"]
+        );
+        assert_eq!(
+            decode_source_paths(r#"["/home/ryan/Documents","/home/ryan/Pictures"]"#),
+            vec!["/home/ryan/Documents", "/home/ryan/Pictures"]
         );
     }
 
@@ -913,7 +1025,7 @@ mod tests {
         let job = SyncJob {
             id: 1,
             name: "Integration test".into(),
-            source_path: source_dir.to_string_lossy().into_owned(),
+            source_paths: vec![source_dir.to_string_lossy().into_owned()],
             destination: format!(":local:{}", destination_dir.display()),
             interval_minutes: 60,
             enabled: true,
@@ -938,5 +1050,59 @@ mod tests {
         );
 
         std::fs::remove_dir_all(root).expect("clean up copy test");
+    }
+
+    #[test]
+    fn multiple_sources_are_kept_in_separate_destination_folders() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock should be after the Unix epoch")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "cloudfolder-multi-test-{}-{unique}",
+            std::process::id()
+        ));
+        let documents = root.join("Documents");
+        let pictures = root.join("Pictures");
+        let destination = root.join("destination");
+        std::fs::create_dir_all(&documents).expect("create documents fixture");
+        std::fs::create_dir_all(&pictures).expect("create pictures fixture");
+        std::fs::create_dir_all(&destination).expect("create destination fixture");
+        std::fs::write(documents.join("same-name.txt"), "document content")
+            .expect("write document fixture");
+        std::fs::write(pictures.join("same-name.txt"), "picture content")
+            .expect("write picture fixture");
+
+        let job = SyncJob {
+            id: 2,
+            name: "Multiple sources".into(),
+            source_paths: vec![
+                documents.to_string_lossy().into_owned(),
+                pictures.to_string_lossy().into_owned(),
+            ],
+            destination: format!(":local:{}", destination.display()),
+            interval_minutes: 60,
+            enabled: true,
+            last_run_at: None,
+            next_run_at: None,
+            status: "ready".into(),
+            last_message: None,
+            created_at: now_string(),
+        };
+
+        let result = perform_copy(&job);
+        assert!(result.is_ok(), "multi-source copy failed: {result:?}");
+        assert_eq!(
+            std::fs::read_to_string(destination.join("Documents/same-name.txt"))
+                .expect("read backed up document"),
+            "document content"
+        );
+        assert_eq!(
+            std::fs::read_to_string(destination.join("Pictures/same-name.txt"))
+                .expect("read backed up picture"),
+            "picture content"
+        );
+
+        std::fs::remove_dir_all(root).expect("clean up multi-source test");
     }
 }

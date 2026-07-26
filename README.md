@@ -1,5 +1,7 @@
 # CloudFolder Sync
 
+[![Support Ryan on Ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/ryanrobertolson)
+
 CloudFolder Sync is an Ubuntu desktop application for selecting local files or
 folders and safely backing them up to Google Drive—or any cloud provider
 supported by [rclone](https://rclone.org/).
@@ -10,6 +12,7 @@ new and changed content without deleting files that already exist in the cloud.
 ## Current features
 
 - Native Ubuntu file and folder picker
+- Multiple local files and folders in a single backup job
 - Google Drive folder browser with folder creation
 - Persistent backup jobs stored in SQLite
 - User-selectable schedules from every 15 minutes to daily
@@ -59,6 +62,12 @@ rclone lsd gdrive:
 CloudFolder reads the resulting remote names but does not read or display the
 stored credentials.
 
+## Support CloudFolder
+
+If CloudFolder is useful to you, you can support continued development on
+[Ryan's Ko-fi page](https://ko-fi.com/ryanrobertolson). The same link is
+available from the **Support CloudFolder** button in the app sidebar.
+
 ## Development
 
 Install JavaScript dependencies:
@@ -104,3 +113,5 @@ desktop interface.
 - Removing a job only removes its local configuration and history.
 - A disconnected drive or unavailable source produces an error instead of
   modifying the destination.
+- When a job has multiple sources, each source is stored in its own named cloud
+  subfolder to prevent filename collisions.

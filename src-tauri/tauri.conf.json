@@ -1,0 +1,41 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "CloudFolder Sync",
+  "version": "0.2.0",
+  "identifier": "com.cloudfolder.sync",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "devUrl": "http://localhost:1420",
+    "beforeBuildCommand": "npm run build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "CloudFolder Sync",
+        "width": 1180,
+        "height": 790,
+        "minWidth": 780,
+        "minHeight": 600,
+        "center": true
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["deb", "appimage"],
+    "icon": ["icons/icon.png"],
+    "category": "Utility",
+    "shortDescription": "Safe scheduled cloud backups for Ubuntu",
+    "longDescription": "Select local files and folders, back them up to a cloud remote, and keep them updated on a schedule.",
+    "linux": {
+      "deb": {
+        "depends": ["rclone"]
+      }
+    }
+  }
+}

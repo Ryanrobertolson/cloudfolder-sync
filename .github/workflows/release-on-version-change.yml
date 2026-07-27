@@ -1,0 +1,198 @@
+name: Release when version changes
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - package.json
+      - package-lock.json
+      - src-tauri/Cargo.toml
+      - src-tauri/Cargo.lock
+      - src-tauri/tauri.conf.json
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: cloudfolder-release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Build and publish Ubuntu release
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Check out the release commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Check whether a new release is needed
+        id: version
+        env:
+          BEFORE_SHA: ${{ github.event.before }}
+          EVENT_NAME: ${{ github.event_name }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          package_version="$(node --print "require('./package.json').version")"
+          package_lock_version="$(node --print "require('./package-lock.json').packages[''].version")"
+          tauri_version="$(node --print "require('./src-tauri/tauri.conf.json').version")"
+          cargo_version="$(
+            python3 - <<'PY'
+          import tomllib
+          with open("src-tauri/Cargo.toml", "rb") as file:
+              print(tomllib.load(file)["package"]["version"])
+          PY
+          )"
+          cargo_lock_version="$(
+            python3 - <<'PY'
+          import tomllib
+          with open("src-tauri/Cargo.lock", "rb") as file:
+              packages = tomllib.load(file)["package"]
+          print(next(package["version"] for package in packages if package["name"] == "cloudfolder-sync"))
+          PY
+          )"
+
+          if [[ ! "$package_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([+-][0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::package.json has an invalid version: $package_version"
+            exit 1
+          fi
+
+          for declared_version in \
+            "$package_lock_version" \
+            "$tauri_version" \
+            "$cargo_version" \
+            "$cargo_lock_version"
+          do
+            if [[ "$declared_version" != "$package_version" ]]; then
+              echo "::error::Version files do not match. Expected $package_version but found $declared_version."
+              exit 1
+            fi
+          done
+
+          previous_version=""
+          if [[ "$EVENT_NAME" == "push" && -n "${BEFORE_SHA:-}" ]] &&
+             [[ "$BEFORE_SHA" != "0000000000000000000000000000000000000000" ]] &&
+             git cat-file -e "${BEFORE_SHA}:package.json" 2>/dev/null
+          then
+            previous_version="$(
+              git show "${BEFORE_SHA}:package.json" |
+                node -e "let input=''; process.stdin.on('data', chunk => input += chunk); process.stdin.on('end', () => console.log(JSON.parse(input).version));"
+            )"
+          fi
+
+          tag="v${package_version}"
+          release_needed=true
+          reason="Version changed from ${previous_version:-none} to ${package_version}."
+
+          if [[ "$EVENT_NAME" == "push" && "$previous_version" == "$package_version" ]]; then
+            release_needed=false
+            reason="The pushed files did not change the app version."
+          elif gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            release_needed=false
+            reason="GitHub Release $tag already exists."
+          fi
+
+          {
+            echo "version=$package_version"
+            echo "tag=$tag"
+            echo "release_needed=$release_needed"
+          } >> "$GITHUB_OUTPUT"
+
+          {
+            echo "## Release check"
+            echo
+            echo "- Current version: \`$package_version\`"
+            echo "- Previous version: \`${previous_version:-not available}\`"
+            echo "- Release needed: \`$release_needed\`"
+            echo "- Result: $reason"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Install Ubuntu build dependencies
+        if: steps.version.outputs.release_needed == 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes \
+            build-essential \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libssl-dev \
+            libwebkit2gtk-4.1-dev \
+            patchelf \
+            rclone
+
+      - name: Set up stable Rust
+        if: steps.version.outputs.release_needed == 'true'
+        run: |
+          rustup update stable
+          rustup default stable
+
+      - name: Install JavaScript dependencies
+        if: steps.version.outputs.release_needed == 'true'
+        run: npm ci
+
+      - name: Test the application
+        if: steps.version.outputs.release_needed == 'true'
+        run: |
+          npm run build
+          cargo test --manifest-path src-tauri/Cargo.toml
+          cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
+
+      - name: Build Ubuntu installers
+        if: steps.version.outputs.release_needed == 'true'
+        run: npm run tauri build
+
+      - name: Tag the release commit
+        if: steps.version.outputs.release_needed == 'true'
+        env:
+          RELEASE_TAG: ${{ steps.version.outputs.tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch --tags --force
+          if git rev-parse --verify --quiet "refs/tags/$RELEASE_TAG" >/dev/null; then
+            tagged_commit="$(git rev-list -n 1 "$RELEASE_TAG")"
+            if [[ "$tagged_commit" != "$GITHUB_SHA" ]]; then
+              echo "::error::Tag $RELEASE_TAG already points to $tagged_commit, not $GITHUB_SHA."
+              exit 1
+            fi
+          else
+            git tag "$RELEASE_TAG" "$GITHUB_SHA"
+            git push origin "$RELEASE_TAG"
+          fi
+
+      - name: Publish GitHub Release
+        if: steps.version.outputs.release_needed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ steps.version.outputs.tag }}
+          RELEASE_VERSION: ${{ steps.version.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          assets=(
+            src-tauri/target/release/bundle/deb/*.deb
+            src-tauri/target/release/bundle/appimage/*.AppImage
+          )
+          if [[ "${#assets[@]}" -ne 2 ]]; then
+            echo "::error::Expected one .deb and one AppImage, but found ${#assets[@]} release files."
+            exit 1
+          fi
+          gh release create "$RELEASE_TAG" "${assets[@]}" \
+            --repo "$GITHUB_REPOSITORY" \
+            --verify-tag \
+            --title "CloudFolder Sync $RELEASE_VERSION" \
+            --generate-notes

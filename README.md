@@ -157,6 +157,23 @@ notes, and download the correct Linux package.
 Updates are never silently installed, and download links are accepted only from
 the project's GitHub Releases.
 
+## Automatic GitHub releases
+
+The **Release when version changes** GitHub Actions workflow watches the version
+files on `main`. When the version changes, it verifies that `package.json`,
+`package-lock.json`, `src-tauri/Cargo.toml`, `src-tauri/Cargo.lock`, and
+`src-tauri/tauri.conf.json` all contain the same version. It then:
+
+1. Builds and tests the application on Ubuntu.
+2. Creates a `v<version>` tag on the exact commit that passed.
+3. Generates release notes from the commits since the previous release.
+4. Publishes a GitHub Release with the `.deb` and AppImage attached.
+
+If the version did not change or that release already exists, the workflow
+stops without publishing a duplicate. It can also be run manually from the
+repository's **Actions** tab to publish the current version if its release is
+missing.
+
 ## Safety boundaries
 
 - Only paths readable by the current Ubuntu user can be backed up.

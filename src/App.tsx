@@ -24,6 +24,9 @@ interface SyncJob {
   next_run_at: string | null;
   status: JobStatus;
   last_message: string | null;
+  progress_percent: number;
+  progress_message: string | null;
+  retention_count: number;
   created_at: string;
 }
 
@@ -42,6 +45,22 @@ interface ErrorLog {
   job_name: string;
   started_at: string;
   finished_at: string;
+  message: string;
+}
+
+interface VersionSnapshot {
+  name: string;
+  created_at: string;
+}
+
+interface VersionFile {
+  path: string;
+  size: number;
+  modified_at: string | null;
+}
+
+interface RestoredVersion {
+  path: string;
   message: string;
 }
 
@@ -89,6 +108,7 @@ interface JobDraft {
   cloud_path: string | null;
   interval_minutes: number;
   backup_mode: BackupMode;
+  retention_count: number;
 }
 
 interface CloudFolderEntry {
@@ -103,6 +123,7 @@ const initialDraft: JobDraft = {
   cloud_path: null,
   interval_minutes: 60,
   backup_mode: "incremental",
+  retention_count: 5,
 };
 
 function formatTime(value: string | null): string {
@@ -174,6 +195,16 @@ export default function App() {
   const [notice, setNotice] = useState<string | null>(null);
   const [selectedJob, setSelectedJob] = useState<SyncJob | null>(null);
   const [runs, setRuns] = useState<RunRecord[]>([]);
+  const [versionJob, setVersionJob] = useState<SyncJob | null>(null);
+  const [versionSnapshots, setVersionSnapshots] = useState<VersionSnapshot[]>(
+    [],
+  );
+  const [selectedSnapshot, setSelectedSnapshot] =
+    useState<VersionSnapshot | null>(null);
+  const [versionFiles, setVersionFiles] = useState<VersionFile[]>([]);
+  const [versionsLoading, setVersionsLoading] = useState(false);
+  const [versionsError, setVersionsError] = useState<string | null>(null);
+  const [restoringFile, setRestoringFile] = useState<string | null>(null);
   const [showErrorLog, setShowErrorLog] = useState(false);
   const [errorLogs, setErrorLogs] = useState<ErrorLog[]>([]);
   const [errorLogsLoading, setErrorLogsLoading] = useState(false);
@@ -230,6 +261,14 @@ export default function App() {
     }
   }, []);
 
+  const refreshJobs = useCallback(async () => {
+    try {
+      setJobs((await invoke<SyncJob[]>("list_jobs")) ?? []);
+    } catch (reason) {
+      setError(String(reason));
+    }
+  }, []);
+
   useEffect(() => {
     void refresh();
     const timer = window.setInterval(() => void refresh(), 15_000);
@@ -245,6 +284,16 @@ export default function App() {
     () => jobs.filter((job) => job.enabled).length,
     [jobs],
   );
+  const hasRunningJob =
+    runningIds.size > 0 || jobs.some((job) => job.status === "running");
+
+  useEffect(() => {
+    const timer = window.setInterval(
+      () => void refreshJobs(),
+      hasRunningJob ? 750 : 5_000,
+    );
+    return () => window.clearInterval(timer);
+  }, [hasRunningJob, refreshJobs]);
 
   async function chooseSource(directory: boolean) {
     const selected = await open({ directory, multiple: true });
@@ -338,6 +387,7 @@ export default function App() {
       cloud_path: job.destination.slice(remote.length),
       interval_minutes: job.interval_minutes,
       backup_mode: job.backup_mode,
+      retention_count: job.retention_count,
     });
     setScheduleEditor(job.interval_minutes);
     setMirrorAcknowledged(job.backup_mode === "mirror");
@@ -362,6 +412,7 @@ export default function App() {
         destination: `${draft.remote}${cleanCloudPath}`,
         interval_minutes: Number(draft.interval_minutes),
         backup_mode: draft.backup_mode,
+        retention_count: Number(draft.retention_count),
       };
       await invoke<SyncJob>(editingJob ? "update_job" : "create_job", {
         ...(editingJob ? { jobId: editingJob.id } : {}),
@@ -445,7 +496,7 @@ export default function App() {
   async function runJob(job: SyncJob) {
     setRunningIds((current) => new Set(current).add(job.id));
     setError(null);
-    setNotice(`Backing up ${job.name}…`);
+    setNotice(null);
     try {
       const result = await invoke<RunRecord>("run_job", { jobId: job.id });
       setNotice(
@@ -496,6 +547,87 @@ export default function App() {
       setRuns(await invoke<RunRecord[]>("job_history", { jobId: job.id }));
     } catch (reason) {
       setError(String(reason));
+    }
+  }
+
+  async function loadVersionFiles(
+    job: SyncJob,
+    snapshot: VersionSnapshot,
+  ) {
+    setSelectedSnapshot(snapshot);
+    setVersionsLoading(true);
+    setVersionsError(null);
+    try {
+      setVersionFiles(
+        (await invoke<VersionFile[]>("list_version_files", {
+          jobId: job.id,
+          snapshotName: snapshot.name,
+        })) ?? [],
+      );
+    } catch (reason) {
+      setVersionFiles([]);
+      setVersionsError(String(reason));
+    } finally {
+      setVersionsLoading(false);
+    }
+  }
+
+  async function openPreviousFiles(job: SyncJob) {
+    setSelectedJob(null);
+    setVersionJob(job);
+    setVersionSnapshots([]);
+    setSelectedSnapshot(null);
+    setVersionFiles([]);
+    setVersionsLoading(true);
+    setVersionsError(null);
+    try {
+      const snapshots =
+        (await invoke<VersionSnapshot[]>("list_version_snapshots", {
+          jobId: job.id,
+        })) ?? [];
+      setVersionSnapshots(snapshots);
+      if (snapshots.length > 0) {
+        await loadVersionFiles(job, snapshots[0]);
+      }
+    } catch (reason) {
+      setVersionsError(String(reason));
+      setVersionsLoading(false);
+    }
+  }
+
+  function closePreviousFiles() {
+    setVersionJob(null);
+    setVersionSnapshots([]);
+    setSelectedSnapshot(null);
+    setVersionFiles([]);
+    setVersionsError(null);
+    setRestoringFile(null);
+  }
+
+  async function restorePreviousFile(file: VersionFile) {
+    if (!versionJob || !selectedSnapshot) return;
+    const selected = await open({
+      directory: true,
+      multiple: false,
+      title: "Choose where to put the restored file",
+    });
+    if (!selected) return;
+    const destination = Array.isArray(selected) ? selected[0] : selected;
+    if (!destination) return;
+    setRestoringFile(file.path);
+    setVersionsError(null);
+    try {
+      const restored = await invoke<RestoredVersion>("restore_version_file", {
+        jobId: versionJob.id,
+        snapshotName: selectedSnapshot.name,
+        filePath: file.path,
+        destinationDir: destination,
+      });
+      setNotice(`${restored.message} Saved to ${shortPath(restored.path)}`);
+    } catch (reason) {
+      setVersionsError(String(reason));
+    } finally {
+      setRestoringFile(null);
     }
   }
 
@@ -813,17 +945,29 @@ export default function App() {
             <div className="job-list">
               {jobs.map((job) => {
                 const isRunning = runningIds.has(job.id) || job.status === "running";
+                const progressPercent =
+                  runningIds.has(job.id) && job.status !== "running"
+                    ? 0
+                    : Math.max(0, Math.min(100, job.progress_percent ?? 0));
                 return (
                   <article className="job-card" key={job.id}>
                     <button
                       className="job-main"
                       onClick={() => void showHistory(job)}
                     >
-                      <span className={`status-dot ${job.status}`} />
+                      <span
+                        className={`status-dot ${
+                          isRunning ? "running" : job.status
+                        }`}
+                      />
                       <div className="job-copy">
                         <div className="job-title-row">
                           <h3>{job.name}</h3>
-                          <span className={`status-pill ${job.status}`}>
+                          <span
+                            className={`status-pill ${
+                              isRunning ? "running" : job.status
+                            }`}
+                          >
                             {isRunning ? "Running" : job.status}
                           </span>
                         </div>
@@ -853,13 +997,36 @@ export default function App() {
                         />
                         <span />
                       </label>
-                      <button
-                        className="run-button"
-                        disabled={isRunning}
-                        onClick={() => void runJob(job)}
-                      >
-                        {isRunning ? "Backing up…" : "Back up now"}
-                      </button>
+                      {isRunning ? (
+                        <div
+                          className="backup-progress"
+                          role="progressbar"
+                          aria-label={`Backing up ${job.name}`}
+                          aria-valuemin={0}
+                          aria-valuemax={100}
+                          aria-valuenow={progressPercent}
+                        >
+                          <div className="backup-progress-copy">
+                            <small>
+                              {job.progress_message ??
+                                `Backing up ${job.name}`}
+                            </small>
+                            <strong>{progressPercent}%</strong>
+                          </div>
+                          <div className="backup-progress-track">
+                            <span
+                              style={{ width: `${progressPercent}%` }}
+                            />
+                          </div>
+                        </div>
+                      ) : (
+                        <button
+                          className="run-button"
+                          onClick={() => void runJob(job)}
+                        >
+                          Back up now
+                        </button>
+                      )}
                     </div>
                   </article>
                 );
@@ -1231,6 +1398,68 @@ export default function App() {
                   </label>
                 )}
               </fieldset>
+
+              {draft.backup_mode === "incremental" ||
+              draft.backup_mode === "mirror" ? (
+                <fieldset className="retention-fieldset">
+                  <legend>Previous files</legend>
+                  <label className="retention-toggle">
+                    <input
+                      type="checkbox"
+                      checked={draft.retention_count > 0}
+                      onChange={(event) =>
+                        setDraft({
+                          ...draft,
+                          retention_count: event.target.checked ? 5 : 0,
+                        })
+                      }
+                    />
+                    <span>
+                      <strong>Keep a safety copy when a file changes</strong>
+                      <small>
+                        Changed or deleted cloud files can be restored later.
+                      </small>
+                    </span>
+                  </label>
+                  {draft.retention_count > 0 && (
+                    <div className="retention-count">
+                      <label>
+                        Keep the last
+                        <input
+                          aria-label="Number of previous backups to keep"
+                          type="number"
+                          min={1}
+                          max={50}
+                          value={draft.retention_count}
+                          onChange={(event) =>
+                            setDraft({
+                              ...draft,
+                              retention_count: Math.max(
+                                1,
+                                Math.min(50, Number(event.target.value) || 1),
+                              ),
+                            })
+                          }
+                        />
+                        backup runs
+                      </label>
+                      <p>
+                        Older safety copies are removed automatically. The live
+                        backup is never counted.
+                      </p>
+                    </div>
+                  )}
+                </fieldset>
+              ) : (
+                <div className="dated-copy-note">
+                  <span aria-hidden="true">◷</span>
+                  <p>
+                    <strong>This backup type already keeps dated copies.</strong>
+                    Full and differential backups place older files in dated
+                    cloud folders.
+                  </p>
+                </div>
+              )}
 
               <fieldset className="schedule-fieldset">
                 <legend>Run automatically</legend>
@@ -1730,6 +1959,133 @@ export default function App() {
         </div>
       )}
 
+      {versionJob && (
+        <div className="modal-backdrop" onMouseDown={closePreviousFiles}>
+          <section
+            className="modal versions-modal"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="versions-title"
+            onMouseDown={(event) => event.stopPropagation()}
+          >
+            <button
+              className="modal-close"
+              aria-label="Close previous files"
+              onClick={closePreviousFiles}
+            >
+              ×
+            </button>
+            <div className="versions-heading">
+              <div className="versions-icon" aria-hidden="true">↶</div>
+              <div>
+                <p className="eyebrow">Safety copies</p>
+                <h2 id="versions-title">Previous files for {versionJob.name}</h2>
+                <p>
+                  Choose an older file and restore it to a folder on this
+                  computer.
+                </p>
+              </div>
+            </div>
+
+            <div className="restore-safety-note">
+              <span aria-hidden="true">✓</span>
+              <p>
+                <strong>Your current files stay untouched.</strong>
+                If the same filename already exists, CloudFolder gives the
+                restored file a new name.
+              </p>
+            </div>
+
+            {versionsError && (
+              <div className="version-error" role="alert">
+                <span>!</span>
+                <p>{versionsError}</p>
+              </div>
+            )}
+
+            {versionsLoading && versionSnapshots.length === 0 ? (
+              <div className="versions-empty">
+                <span className="tiny-spinner" />
+                <strong>Looking for previous files…</strong>
+              </div>
+            ) : versionSnapshots.length === 0 ? (
+              <div className="versions-empty">
+                <span aria-hidden="true">◷</span>
+                <strong>No previous files yet</strong>
+                <p>
+                  A safety copy appears here after a cloud file is changed or
+                  deleted by a backup.
+                </p>
+              </div>
+            ) : (
+              <>
+                <div className="snapshot-picker">
+                  <strong>Backup run</strong>
+                  <div>
+                    {versionSnapshots.map((snapshot) => (
+                      <button
+                        className={
+                          selectedSnapshot?.name === snapshot.name
+                            ? "selected"
+                            : ""
+                        }
+                        key={snapshot.name}
+                        onClick={() =>
+                          void loadVersionFiles(versionJob, snapshot)
+                        }
+                      >
+                        <span>◷</span>
+                        {formatTime(snapshot.created_at)}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+
+                <div className="version-file-list">
+                  {versionsLoading ? (
+                    <div className="versions-empty compact">
+                      <span className="tiny-spinner" />
+                      <strong>Opening this backup…</strong>
+                    </div>
+                  ) : versionFiles.length === 0 ? (
+                    <div className="versions-empty compact">
+                      <span aria-hidden="true">✓</span>
+                      <strong>No files were replaced in this run</strong>
+                    </div>
+                  ) : (
+                    versionFiles.map((file) => (
+                      <article key={file.path}>
+                        <span className="version-file-icon" aria-hidden="true">
+                          ▤
+                        </span>
+                        <div>
+                          <strong title={file.path}>{file.path}</strong>
+                          <small>
+                            {formatFileSize(file.size) || "Small file"}
+                            {file.modified_at
+                              ? ` · Changed ${formatTime(file.modified_at)}`
+                              : ""}
+                          </small>
+                        </div>
+                        <button
+                          className="secondary"
+                          disabled={restoringFile !== null}
+                          onClick={() => void restorePreviousFile(file)}
+                        >
+                          {restoringFile === file.path
+                            ? "Restoring…"
+                            : "Restore"}
+                        </button>
+                      </article>
+                    ))
+                  )}
+                </div>
+              </>
+            )}
+          </section>
+        </div>
+      )}
+
       {selectedJob && (
         <div className="modal-backdrop" onMouseDown={() => setSelectedJob(null)}>
           <section
@@ -1765,6 +2121,17 @@ export default function App() {
                 <dd>{backupModeLabel(selectedJob.backup_mode)}</dd>
               </div>
               <div>
+                <dt>Previous files</dt>
+                <dd>
+                  {selectedJob.backup_mode === "incremental" ||
+                  selectedJob.backup_mode === "mirror"
+                    ? selectedJob.retention_count > 0
+                      ? `Keep ${selectedJob.retention_count} backup runs`
+                      : "Turned off"
+                    : "Stored in dated backup folders"}
+                </dd>
+              </div>
+              <div>
                 <dt>Next run</dt>
                 <dd>{formatTime(selectedJob.next_run_at)}</dd>
               </div>
@@ -1787,12 +2154,24 @@ export default function App() {
               )}
             </div>
             <div className="job-detail-actions">
-              <button
-                className="secondary"
-                onClick={() => openEditJob(selectedJob)}
-              >
-                Edit backup
-              </button>
+              <div className="job-detail-safe-actions">
+                <button
+                  className="secondary"
+                  onClick={() => openEditJob(selectedJob)}
+                >
+                  Edit backup
+                </button>
+                {(selectedJob.backup_mode === "incremental" ||
+                  selectedJob.backup_mode === "mirror") && (
+                  <button
+                    className="secondary previous-files-button"
+                    disabled={selectedJob.retention_count === 0}
+                    onClick={() => void openPreviousFiles(selectedJob)}
+                  >
+                    Previous files
+                  </button>
+                )}
+              </div>
               <div className="danger-row">
                 <button
                   className="danger"

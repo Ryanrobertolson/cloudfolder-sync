@@ -19,6 +19,8 @@ True mirroring is available as an explicitly destructive option with a warning.
 - Editable backup names, sources, destinations, and schedules
 - Full, incremental, differential, and mirroring transfer modes
 - Manual **Back up now** action
+- Live percentage and progress bar while files are being copied
+- Configurable cloud safety copies with in-app file recovery
 - Google Drive and other rclone remote discovery
 - Always-on scheduling through a systemd user service
 - System tray behavior when the main window is closed
@@ -124,6 +126,22 @@ Backup types behave as follows:
   dated folders containing files changed since that baseline.
 - **Mirroring** makes the destination match the computer and can delete files
   from the selected cloud destination.
+
+## Previous files and recovery
+
+Incremental and mirror jobs can keep older cloud files when a backup replaces
+or deletes them. This protection is enabled by default for five backup runs and
+can be set from 1 to 50, or turned off, in the backup editor.
+
+Safety copies are stored outside the live backup in
+`CloudFolder Previous Files/Backup <job number>`. After the configured number
+of backup runs with changes, the oldest safety-copy folder is removed
+automatically. Full and differential jobs already create dated cloud folders.
+
+To recover something, open the backup card and select **Previous files**. Pick
+a backup run and file, press **Restore**, and choose a folder on the computer.
+CloudFolder never overwrites a local file during recovery; if the filename
+already exists, the restored copy receives a new name.
 
 ## Program updates
 

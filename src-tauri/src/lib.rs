@@ -3,8 +3,9 @@ use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashSet,
+    io::{BufRead, BufReader},
     path::{Path, PathBuf},
-    process::Command,
+    process::{Command, Stdio},
     sync::{Arc, Mutex},
     time::Duration as StdDuration,
 };
@@ -58,6 +59,9 @@ struct SyncJob {
     next_run_at: Option<String>,
     status: String,
     last_message: Option<String>,
+    progress_percent: i64,
+    progress_message: Option<String>,
+    retention_count: i64,
     created_at: String,
 }
 
@@ -68,6 +72,7 @@ struct NewJob {
     destination: String,
     interval_minutes: i64,
     backup_mode: String,
+    retention_count: i64,
 }
 
 #[derive(Debug, Serialize)]
@@ -100,6 +105,37 @@ struct CloudFolderEntry {
 struct RcloneListItem {
     #[serde(rename = "Name")]
     name: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct RcloneVersionItem {
+    #[serde(rename = "Name")]
+    name: String,
+    #[serde(rename = "Path", default)]
+    path: String,
+    #[serde(rename = "Size", default)]
+    size: u64,
+    #[serde(rename = "ModTime")]
+    modified_at: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct VersionSnapshot {
+    name: String,
+    created_at: String,
+}
+
+#[derive(Debug, Serialize)]
+struct VersionFile {
+    path: String,
+    size: u64,
+    modified_at: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct RestoredVersion {
+    path: String,
+    message: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -174,6 +210,9 @@ fn initialize_database(path: &Path) -> AppResult<()> {
             next_run_at      TEXT,
             status           TEXT NOT NULL DEFAULT 'ready',
             last_message     TEXT,
+            progress_percent INTEGER NOT NULL DEFAULT 0,
+            progress_message TEXT,
+            retention_count  INTEGER NOT NULL DEFAULT 5,
             created_at       TEXT NOT NULL
         );
 
@@ -202,13 +241,30 @@ fn initialize_database(path: &Path) -> AppResult<()> {
         "last_full_at",
         "ALTER TABLE jobs ADD COLUMN last_full_at TEXT",
     )?;
+    ensure_job_column(
+        &connection,
+        "progress_percent",
+        "ALTER TABLE jobs ADD COLUMN progress_percent INTEGER NOT NULL DEFAULT 0",
+    )?;
+    ensure_job_column(
+        &connection,
+        "progress_message",
+        "ALTER TABLE jobs ADD COLUMN progress_message TEXT",
+    )?;
+    ensure_job_column(
+        &connection,
+        "retention_count",
+        "ALTER TABLE jobs ADD COLUMN retention_count INTEGER NOT NULL DEFAULT 5",
+    )?;
     Ok(())
 }
 
 fn reset_interrupted_jobs(path: &Path) -> AppResult<()> {
     let connection = connect(path)?;
     connection.execute(
-        "UPDATE jobs SET status = 'ready', last_message = 'Previous run was interrupted'
+        "UPDATE jobs
+         SET status = 'ready', last_message = 'Previous run was interrupted',
+             progress_percent = 0, progress_message = NULL
          WHERE status = 'running'",
         [],
     )?;
@@ -241,7 +297,10 @@ fn map_job(row: &rusqlite::Row<'_>) -> rusqlite::Result<SyncJob> {
         next_run_at: row.get(9)?,
         status: row.get(10)?,
         last_message: row.get(11)?,
-        created_at: row.get(12)?,
+        progress_percent: row.get(12)?,
+        progress_message: row.get(13)?,
+        retention_count: row.get(14)?,
+        created_at: row.get(15)?,
     })
 }
 
@@ -257,7 +316,8 @@ fn get_job(connection: &Connection, job_id: i64) -> AppResult<SyncJob> {
         .query_row(
             "SELECT id, name, source_path, destination, interval_minutes,
                     backup_mode, last_full_at, enabled, last_run_at, next_run_at,
-                    status, last_message, created_at
+                    status, last_message, progress_percent, progress_message,
+                    retention_count, created_at
              FROM jobs WHERE id = ?1",
             [job_id],
             map_job,
@@ -281,6 +341,11 @@ fn validate_new_job(input: &NewJob) -> AppResult<()> {
     ) {
         return Err(AppError::Validation(
             "Choose a supported backup mode".into(),
+        ));
+    }
+    if !(0..=50).contains(&input.retention_count) {
+        return Err(AppError::Validation(
+            "Choose between 1 and 50 previous backups, or turn previous files off".into(),
         ));
     }
     if input.source_paths.is_empty() {
@@ -348,7 +413,8 @@ fn list_jobs(state: State<'_, AppState>) -> AppResult<Vec<SyncJob>> {
     let mut statement = connection.prepare(
         "SELECT id, name, source_path, destination, interval_minutes,
                 backup_mode, last_full_at, enabled, last_run_at, next_run_at,
-                status, last_message, created_at
+                status, last_message, progress_percent, progress_message,
+                retention_count, created_at
          FROM jobs ORDER BY created_at DESC",
     )?;
     let jobs = statement
@@ -368,14 +434,15 @@ fn create_job(input: NewJob, state: State<'_, AppState>) -> AppResult<SyncJob> {
     connection.execute(
         "INSERT INTO jobs
             (name, source_path, destination, interval_minutes, backup_mode,
-             enabled, next_run_at, status, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, 1, ?6, 'ready', ?7)",
+             retention_count, enabled, next_run_at, status, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1, ?7, 'ready', ?8)",
         params![
             input.name.trim(),
             stored_sources,
             input.destination,
             input.interval_minutes,
             input.backup_mode,
+            input.retention_count,
             next_run,
             created_at
         ],
@@ -402,8 +469,9 @@ fn update_job_record(connection: &Connection, job_id: i64, input: &NewJob) -> Ap
         "UPDATE jobs
          SET name = ?1, source_path = ?2, destination = ?3,
              interval_minutes = ?4, backup_mode = ?5, last_full_at = ?6,
-             next_run_at = ?7, status = ?8
-         WHERE id = ?9",
+             retention_count = ?7, next_run_at = ?8, status = ?9,
+             progress_percent = 0, progress_message = NULL
+         WHERE id = ?10",
         params![
             input.name.trim(),
             stored_sources,
@@ -411,6 +479,7 @@ fn update_job_record(connection: &Connection, job_id: i64, input: &NewJob) -> Ap
             input.interval_minutes,
             input.backup_mode,
             last_full_at,
+            input.retention_count,
             next_run,
             if current.enabled { "ready" } else { "paused" },
             job_id
@@ -448,7 +517,8 @@ fn set_job_enabled(job_id: i64, enabled: bool, state: State<'_, AppState>) -> Ap
     };
     connection.execute(
         "UPDATE jobs
-         SET enabled = ?1, next_run_at = ?2, status = ?3
+         SET enabled = ?1, next_run_at = ?2, status = ?3,
+             progress_percent = 0, progress_message = NULL
          WHERE id = ?4",
         params![
             i64::from(enabled),
@@ -515,8 +585,191 @@ fn backup_stamp() -> String {
     Utc::now().format("%Y-%m-%d_%H-%M-%S").to_string()
 }
 
-fn perform_copy(job: &SyncJob) -> AppResult<CopyOutcome> {
+fn supports_previous_files(job: &SyncJob) -> bool {
+    job.retention_count > 0 && matches!(job.backup_mode.as_str(), "incremental" | "mirror")
+}
+
+fn version_history_root(job: &SyncJob) -> AppResult<String> {
+    let remote_end = if job.destination.starts_with(':') {
+        job.destination[1..].find(':').map(|index| index + 2)
+    } else {
+        job.destination.find(':').map(|index| index + 1)
+    }
+    .ok_or_else(|| AppError::Validation("The backup destination has no cloud connection".into()))?;
+    let remote = &job.destination[..remote_end];
+    let history_parent = if remote == ":local:" {
+        let local_destination = Path::new(&job.destination[remote_end..]);
+        let parent = local_destination.parent().unwrap_or_else(|| Path::new("/"));
+        format!("{remote}{}", parent.display())
+    } else {
+        remote.to_owned()
+    };
+    Ok(child_cloud_destination(
+        &child_cloud_destination(&history_parent, "CloudFolder Previous Files"),
+        &format!("Backup {}", job.id),
+    ))
+}
+
+fn version_snapshot_destination(job: &SyncJob, snapshot_name: &str) -> AppResult<String> {
+    Ok(child_cloud_destination(
+        &version_history_root(job)?,
+        snapshot_name,
+    ))
+}
+
+fn snapshot_created_at(name: &str) -> Option<String> {
+    chrono::NaiveDateTime::parse_from_str(name, "%Y-%m-%d_%H-%M-%S")
+        .ok()
+        .map(|value| value.and_utc().to_rfc3339_opts(SecondsFormat::Secs, true))
+}
+
+fn validate_snapshot_name(name: &str) -> AppResult<()> {
+    if snapshot_created_at(name).is_none() {
+        return Err(AppError::Validation(
+            "That previous backup name is not valid".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_version_file_path(path: &str) -> AppResult<()> {
+    if path.is_empty()
+        || path.chars().any(char::is_control)
+        || Path::new(path)
+            .components()
+            .any(|component| !matches!(component, std::path::Component::Normal(_)))
+    {
+        return Err(AppError::Validation(
+            "That previous file path is not valid".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn ensure_version_history(job: &SyncJob) -> AppResult<()> {
+    let root = version_history_root(job)?;
+    let output = Command::new("rclone")
+        .arg("mkdir")
+        .arg(root)
+        .output()
+        .map_err(|error| {
+            AppError::Transfer(format!(
+                "Could not prepare the Previous files folder: {error}"
+            ))
+        })?;
+    if !output.status.success() {
+        return Err(AppError::Transfer(format!(
+            "CloudFolder could not prepare the Previous files folder. {}",
+            compact_output(&output.stdout, &output.stderr)
+        )));
+    }
+    Ok(())
+}
+
+fn version_snapshots_for_job(job: &SyncJob) -> AppResult<Vec<VersionSnapshot>> {
+    if !supports_previous_files(job) {
+        return Ok(Vec::new());
+    }
+    let output = Command::new("rclone")
+        .arg("lsjson")
+        .arg(version_history_root(job)?)
+        .arg("--dirs-only")
+        .arg("--no-modtime")
+        .arg("--no-mimetype")
+        .output()
+        .map_err(|error| AppError::Transfer(format!("Could not read previous backups: {error}")))?;
+    if !output.status.success() {
+        if output.status.code() == Some(3) {
+            return Ok(Vec::new());
+        }
+        return Err(AppError::Transfer(format!(
+            "CloudFolder could not read previous backups. {}",
+            compact_output(&output.stdout, &output.stderr)
+        )));
+    }
+    let mut snapshots = serde_json::from_slice::<Vec<RcloneListItem>>(&output.stdout)
+        .map_err(|error| {
+            AppError::Transfer(format!(
+                "The Previous files folder returned an unreadable list: {error}"
+            ))
+        })?
+        .into_iter()
+        .filter_map(|item| {
+            snapshot_created_at(&item.name).map(|created_at| VersionSnapshot {
+                name: item.name,
+                created_at,
+            })
+        })
+        .collect::<Vec<_>>();
+    snapshots.sort_by(|left, right| right.name.cmp(&left.name));
+    Ok(snapshots)
+}
+
+fn prune_version_history(job: &SyncJob) -> AppResult<()> {
+    let snapshots = version_snapshots_for_job(job)?;
+    for snapshot in snapshots
+        .into_iter()
+        .skip(job.retention_count.max(0) as usize)
+    {
+        let output = Command::new("rclone")
+            .arg("purge")
+            .arg(version_snapshot_destination(job, &snapshot.name)?)
+            .output()
+            .map_err(|error| {
+                AppError::Transfer(format!(
+                    "Could not remove an expired previous backup: {error}"
+                ))
+            })?;
+        if !output.status.success() {
+            return Err(AppError::Transfer(format!(
+                "CloudFolder could not remove an expired previous backup. {}",
+                compact_output(&output.stdout, &output.stderr)
+            )));
+        }
+    }
+    Ok(())
+}
+
+#[derive(Clone)]
+struct ProgressReporter {
+    db_path: PathBuf,
+    job_id: i64,
+}
+
+impl ProgressReporter {
+    fn report(&self, percent: i64, message: &str) {
+        let Ok(connection) = connect(&self.db_path) else {
+            return;
+        };
+        let _ = connection.execute(
+            "UPDATE jobs
+             SET progress_percent = ?1, progress_message = ?2
+             WHERE id = ?3 AND status = 'running'",
+            params![percent.clamp(0, 100), message, self.job_id],
+        );
+    }
+}
+
+fn rclone_progress_percent(line: &str) -> Option<i64> {
+    line.split(',').find_map(|part| {
+        part.trim()
+            .strip_suffix('%')
+            .and_then(|value| value.parse::<i64>().ok())
+            .map(|value| value.clamp(0, 100))
+    })
+}
+
+fn source_progress_message(source_name: &str, source_number: usize, source_count: usize) -> String {
+    if source_count > 1 {
+        format!("Copying {source_name} ({source_number} of {source_count})")
+    } else {
+        format!("Copying {source_name}")
+    }
+}
+
+fn perform_copy(job: &SyncJob, progress: Option<&ProgressReporter>) -> AppResult<CopyOutcome> {
     let multiple_sources = job.source_paths.len() > 1;
+    let source_count = job.source_paths.len();
     let mut completed = Vec::new();
     let mut failures = Vec::new();
     let stamp = backup_stamp();
@@ -535,13 +788,24 @@ fn perform_copy(job: &SyncJob) -> AppResult<CopyOutcome> {
         ),
         _ => (job.destination.clone(), false),
     };
+    if supports_previous_files(job) {
+        ensure_version_history(job)?;
+    }
 
-    for source_path in &job.source_paths {
+    for (source_index, source_path) in job.source_paths.iter().enumerate() {
         let source = Path::new(source_path);
         let source_name = source
             .file_name()
             .map(|name| name.to_string_lossy().into_owned())
             .unwrap_or_else(|| source_path.clone());
+        let progress_message =
+            source_progress_message(&source_name, source_index + 1, source_count);
+        if let Some(progress) = progress {
+            progress.report(
+                ((source_index * 100) / source_count.max(1)) as i64,
+                &progress_message,
+            );
+        }
         if !source.exists() {
             failures.push(format!(
                 "{source_name}: source is unavailable; reconnect its drive and try again"
@@ -564,8 +828,20 @@ fn perform_copy(job: &SyncJob) -> AppResult<CopyOutcome> {
             .arg(&destination)
             .arg("--create-empty-src-dirs")
             .arg("--stats-one-line")
-            .arg("--stats=10s")
-            .arg("--retries=3");
+            .arg("--stats=1s")
+            .arg("--stats-log-level=NOTICE")
+            .arg("--retries=3")
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped());
+        if supports_previous_files(job) {
+            let snapshot = version_snapshot_destination(job, &stamp)?;
+            let backup_directory = if multiple_sources {
+                child_cloud_destination(&snapshot, &source_name)
+            } else {
+                snapshot
+            };
+            command.arg("--backup-dir").arg(backup_directory);
+        }
         if job.backup_mode == "differential" {
             if let Some(last_full_at) = &job.last_full_at {
                 if let Ok(baseline) = chrono::DateTime::parse_from_rfc3339(last_full_at) {
@@ -577,20 +853,64 @@ fn perform_copy(job: &SyncJob) -> AppResult<CopyOutcome> {
                 }
             }
         }
-        let output = command.output().map_err(|error| {
+        let mut child = command.spawn().map_err(|error| {
             AppError::Transfer(format!(
                 "Could not start rclone: {error}. Install rclone and try again."
             ))
         })?;
-        let message = compact_output(&output.stdout, &output.stderr);
-        if output.status.success() {
+        let stderr = child.stderr.take().ok_or_else(|| {
+            AppError::Transfer("CloudFolder could not read rclone progress".into())
+        })?;
+        let mut messages = Vec::new();
+        for line in BufReader::new(stderr).lines() {
+            match line {
+                Ok(line) => {
+                    if let Some(source_percent) = rclone_progress_percent(&line) {
+                        let overall_percent = (((source_index as f64
+                            + source_percent as f64 / 100.0)
+                            / source_count.max(1) as f64)
+                            * 100.0)
+                            .round() as i64;
+                        if let Some(progress) = progress {
+                            progress.report(overall_percent.min(99), &progress_message);
+                        }
+                    } else if !line.trim().is_empty() {
+                        messages.push(line);
+                    }
+                }
+                Err(error) => messages.push(format!("Could not read transfer details: {error}")),
+            }
+        }
+        let status = child.wait()?;
+        if status.success() {
+            if let Some(progress) = progress {
+                let completed_percent = (((source_index + 1) * 100) / source_count.max(1)) as i64;
+                progress.report(completed_percent.min(99), &progress_message);
+            }
+            let message = if messages.is_empty() {
+                "Backup completed".into()
+            } else {
+                compact_output(messages.join("\n").as_bytes(), &[])
+            };
             completed.push(format!("{source_name} → {destination}: {message}"));
         } else {
+            let message = if messages.is_empty() {
+                "rclone stopped before the backup finished".into()
+            } else {
+                compact_output(messages.join("\n").as_bytes(), &[])
+            };
             failures.push(format!("{source_name}: {message}"));
         }
     }
 
     if failures.is_empty() {
+        if supports_previous_files(job) {
+            if let Err(error) = prune_version_history(job) {
+                completed.push(format!(
+                    "Backup completed, but old Previous files need attention: {error}"
+                ));
+            }
+        }
         Ok(CopyOutcome {
             message: completed.join("\n"),
             full_completed,
@@ -635,7 +955,9 @@ async fn execute_job(job_id: i64, state: AppState) -> AppResult<RunRecord> {
         let job = get_job(&connection, job_id)?;
         let started_at = now_string();
         let claimed = connection.execute(
-            "UPDATE jobs SET status = 'running', last_message = NULL
+            "UPDATE jobs
+             SET status = 'running', last_message = NULL,
+                 progress_percent = 0, progress_message = 'Getting ready…'
              WHERE id = ?1 AND status != 'running'",
             [job_id],
         )?;
@@ -647,9 +969,14 @@ async fn execute_job(job_id: i64, state: AppState) -> AppResult<RunRecord> {
         drop(connection);
 
         let job_for_copy = job.clone();
-        let copy_result = tokio::task::spawn_blocking(move || perform_copy(&job_for_copy))
-            .await
-            .map_err(|error| AppError::Transfer(format!("Backup worker failed: {error}")))?;
+        let progress = ProgressReporter {
+            db_path: state.db_path.clone(),
+            job_id,
+        };
+        let copy_result =
+            tokio::task::spawn_blocking(move || perform_copy(&job_for_copy, Some(&progress)))
+                .await
+                .map_err(|error| AppError::Transfer(format!("Backup worker failed: {error}")))?;
 
         let finished_at = now_string();
         let (status, message, full_completed) = match copy_result {
@@ -661,7 +988,9 @@ async fn execute_job(job_id: i64, state: AppState) -> AppResult<RunRecord> {
             "UPDATE jobs
              SET status = ?1, last_message = ?2, last_run_at = ?3,
                  next_run_at = ?4,
-                 last_full_at = CASE WHEN ?5 = 1 THEN ?3 ELSE last_full_at END
+                 last_full_at = CASE WHEN ?5 = 1 THEN ?3 ELSE last_full_at END,
+                 progress_percent = CASE WHEN ?1 = 'success' THEN 100 ELSE 0 END,
+                 progress_message = NULL
              WHERE id = ?6",
             params![
                 status,
@@ -698,6 +1027,156 @@ async fn execute_job(job_id: i64, state: AppState) -> AppResult<RunRecord> {
 #[tauri::command]
 async fn run_job(job_id: i64, state: State<'_, AppState>) -> AppResult<RunRecord> {
     execute_job(job_id, state.inner().clone()).await
+}
+
+#[tauri::command]
+fn list_version_snapshots(
+    job_id: i64,
+    state: State<'_, AppState>,
+) -> AppResult<Vec<VersionSnapshot>> {
+    let connection = connect(&state.db_path)?;
+    let job = get_job(&connection, job_id)?;
+    version_snapshots_for_job(&job)
+}
+
+#[tauri::command]
+fn list_version_files(
+    job_id: i64,
+    snapshot_name: String,
+    state: State<'_, AppState>,
+) -> AppResult<Vec<VersionFile>> {
+    validate_snapshot_name(&snapshot_name)?;
+    let connection = connect(&state.db_path)?;
+    let job = get_job(&connection, job_id)?;
+    if !supports_previous_files(&job) {
+        return Ok(Vec::new());
+    }
+    let output = Command::new("rclone")
+        .arg("lsjson")
+        .arg(version_snapshot_destination(&job, &snapshot_name)?)
+        .arg("--recursive")
+        .arg("--files-only")
+        .arg("--no-mimetype")
+        .output()
+        .map_err(|error| {
+            AppError::Transfer(format!("Could not read the previous files: {error}"))
+        })?;
+    if !output.status.success() {
+        return Err(AppError::Transfer(format!(
+            "CloudFolder could not read that previous backup. {}",
+            compact_output(&output.stdout, &output.stderr)
+        )));
+    }
+    let mut files = serde_json::from_slice::<Vec<RcloneVersionItem>>(&output.stdout)
+        .map_err(|error| {
+            AppError::Transfer(format!(
+                "The previous backup returned an unreadable file list: {error}"
+            ))
+        })?
+        .into_iter()
+        .map(|item| VersionFile {
+            path: if item.path.is_empty() {
+                item.name
+            } else {
+                item.path
+            },
+            size: item.size,
+            modified_at: item.modified_at,
+        })
+        .collect::<Vec<_>>();
+    files.sort_by_key(|file| file.path.to_lowercase());
+    Ok(files)
+}
+
+fn unique_restored_path(destination: &Path, file_name: &str) -> PathBuf {
+    let first_choice = destination.join(file_name);
+    if !first_choice.exists() {
+        return first_choice;
+    }
+    let file_path = Path::new(file_name);
+    let stem = file_path
+        .file_stem()
+        .map(|value| value.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "restored-file".into());
+    let extension = file_path
+        .extension()
+        .map(|value| value.to_string_lossy().into_owned());
+    for copy_number in 1..10_000 {
+        let candidate_name = match &extension {
+            Some(extension) => format!("{stem} (restored {copy_number}).{extension}"),
+            None => format!("{stem} (restored {copy_number})"),
+        };
+        let candidate = destination.join(candidate_name);
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+    destination.join(format!("{stem} (restored {})", backup_stamp()))
+}
+
+fn restore_version_file_for_job(
+    job: &SyncJob,
+    snapshot_name: &str,
+    file_path: &str,
+    destination: &Path,
+) -> AppResult<RestoredVersion> {
+    validate_snapshot_name(snapshot_name)?;
+    validate_version_file_path(file_path)?;
+    if !destination.is_absolute() || !destination.is_dir() {
+        return Err(AppError::Validation(
+            "Choose a folder on this computer for the restored file".into(),
+        ));
+    }
+    if !supports_previous_files(job) {
+        return Err(AppError::Validation(
+            "Previous files are not turned on for this backup".into(),
+        ));
+    }
+    let file_name = Path::new(file_path)
+        .file_name()
+        .map(|value| value.to_string_lossy().into_owned())
+        .ok_or_else(|| AppError::Validation("That previous file has no name".into()))?;
+    let restored_path = unique_restored_path(destination, &file_name);
+    let remote_file = child_cloud_destination(
+        &version_snapshot_destination(job, snapshot_name)?,
+        file_path,
+    );
+    let output = Command::new("rclone")
+        .arg("copyto")
+        .arg(remote_file)
+        .arg(&restored_path)
+        .output()
+        .map_err(|error| {
+            AppError::Transfer(format!("Could not start restoring the file: {error}"))
+        })?;
+    if !output.status.success() {
+        return Err(AppError::Transfer(format!(
+            "CloudFolder could not restore that file. {}",
+            compact_output(&output.stdout, &output.stderr)
+        )));
+    }
+    Ok(RestoredVersion {
+        path: restored_path.to_string_lossy().into_owned(),
+        message: format!("{file_name} was restored without replacing any files on this computer."),
+    })
+}
+
+#[tauri::command]
+fn restore_version_file(
+    job_id: i64,
+    snapshot_name: String,
+    file_path: String,
+    destination_dir: String,
+    state: State<'_, AppState>,
+) -> AppResult<RestoredVersion> {
+    let connection = connect(&state.db_path)?;
+    let job = get_job(&connection, job_id)?;
+    restore_version_file_for_job(
+        &job,
+        &snapshot_name,
+        &file_path,
+        Path::new(&destination_dir),
+    )
 }
 
 #[tauri::command]
@@ -1523,6 +2002,9 @@ pub fn run() {
             set_job_enabled,
             delete_job,
             run_job,
+            list_version_snapshots,
+            list_version_files,
+            restore_version_file,
             job_history,
             list_error_logs,
             list_remotes,
@@ -1555,6 +2037,7 @@ mod tests {
             destination: "drive:Backups".into(),
             interval_minutes: 60,
             backup_mode: "incremental".into(),
+            retention_count: 5,
         };
         assert!(validate_new_job(&input).is_err());
     }
@@ -1567,6 +2050,7 @@ mod tests {
             destination: "Backups".into(),
             interval_minutes: 60,
             backup_mode: "incremental".into(),
+            retention_count: 5,
         };
         assert!(validate_new_job(&input).is_err());
     }
@@ -1582,6 +2066,7 @@ mod tests {
             destination: "drive:Backups".into(),
             interval_minutes: 60,
             backup_mode: "mirror".into(),
+            retention_count: 5,
         };
         assert!(validate_new_job(&input).is_err());
         std::fs::remove_file(file_path).expect("clean up mirror file fixture");
@@ -1593,6 +2078,162 @@ mod tests {
             compact_output(b"", b""),
             "Backup completed; no files needed uploading"
         );
+    }
+
+    #[test]
+    fn reads_percentages_from_rclone_stats() {
+        assert_eq!(
+            rclone_progress_percent(
+                "2026/07/26 NOTICE: 1.027 MiB / 2 MiB, 51%, 1.027 MiB/s, ETA 0s"
+            ),
+            Some(51)
+        );
+        assert_eq!(
+            rclone_progress_percent("2026/07/26 ERROR: Google Drive is offline"),
+            None
+        );
+    }
+
+    #[test]
+    fn progress_labels_explain_multiple_sources() {
+        assert_eq!(
+            source_progress_message("Pictures", 2, 3),
+            "Copying Pictures (2 of 3)"
+        );
+        assert_eq!(
+            source_progress_message("Documents", 1, 1),
+            "Copying Documents"
+        );
+    }
+
+    #[test]
+    fn retention_limits_are_validated() {
+        let mut input = NewJob {
+            name: "Documents".into(),
+            source_paths: vec![std::env::temp_dir().to_string_lossy().into_owned()],
+            destination: "drive:Backups".into(),
+            interval_minutes: 60,
+            backup_mode: "incremental".into(),
+            retention_count: 5,
+        };
+        assert!(validate_new_job(&input).is_ok());
+        input.retention_count = 0;
+        assert!(validate_new_job(&input).is_ok());
+        input.retention_count = 51;
+        assert!(validate_new_job(&input).is_err());
+    }
+
+    #[test]
+    fn previous_file_paths_are_scoped_and_traversal_safe() {
+        let job = SyncJob {
+            id: 42,
+            name: "Renamable backup".into(),
+            source_paths: vec!["/home/ryan/Documents".into()],
+            destination: "CloudFolder:Backups/Documents".into(),
+            interval_minutes: 60,
+            backup_mode: "incremental".into(),
+            last_full_at: None,
+            enabled: true,
+            last_run_at: None,
+            next_run_at: None,
+            status: "ready".into(),
+            last_message: None,
+            progress_percent: 0,
+            progress_message: None,
+            retention_count: 5,
+            created_at: now_string(),
+        };
+        assert_eq!(
+            version_history_root(&job).expect("build version root"),
+            "CloudFolder:CloudFolder Previous Files/Backup 42"
+        );
+        assert!(validate_snapshot_name("2026-07-26_22-30-00").is_ok());
+        assert!(validate_snapshot_name("../../Backups").is_err());
+        assert!(validate_version_file_path("Documents/report.txt").is_ok());
+        assert!(validate_version_file_path("../report.txt").is_err());
+        assert!(validate_version_file_path("/home/ryan/report.txt").is_err());
+    }
+
+    #[test]
+    fn restored_files_never_overwrite_an_existing_file() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock should be after the Unix epoch")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "cloudfolder-restore-name-test-{}-{unique}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).expect("create restore test directory");
+        std::fs::write(root.join("report.txt"), "current").expect("create current file");
+        let restored_path = unique_restored_path(&root, "report.txt");
+        assert_eq!(
+            restored_path.file_name().and_then(|value| value.to_str()),
+            Some("report (restored 1).txt")
+        );
+        std::fs::remove_dir_all(root).expect("clean up restore test");
+    }
+
+    #[test]
+    fn retention_removes_only_snapshots_over_the_limit() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock should be after the Unix epoch")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "cloudfolder-retention-test-{}-{unique}",
+            std::process::id()
+        ));
+        let destination = root.join("destination");
+        std::fs::create_dir_all(&destination).expect("create retention destination");
+        let job = SyncJob {
+            id: 77,
+            name: "Retention".into(),
+            source_paths: vec![root.to_string_lossy().into_owned()],
+            destination: format!(":local:{}", destination.display()),
+            interval_minutes: 60,
+            backup_mode: "incremental".into(),
+            last_full_at: None,
+            enabled: true,
+            last_run_at: None,
+            next_run_at: None,
+            status: "ready".into(),
+            last_message: None,
+            progress_percent: 0,
+            progress_message: None,
+            retention_count: 2,
+            created_at: now_string(),
+        };
+        let history_root = version_history_root(&job)
+            .expect("build retention history path")
+            .strip_prefix(":local:")
+            .expect("local history path")
+            .to_owned();
+        assert!(version_snapshots_for_job(&job)
+            .expect("missing history should be empty")
+            .is_empty());
+        for snapshot in [
+            "2026-07-24_12-00-00",
+            "2026-07-25_12-00-00",
+            "2026-07-26_12-00-00",
+        ] {
+            let snapshot_dir = Path::new(&history_root).join(snapshot);
+            std::fs::create_dir_all(&snapshot_dir).expect("create snapshot fixture");
+            std::fs::write(snapshot_dir.join("old.txt"), snapshot).expect("write snapshot fixture");
+        }
+
+        prune_version_history(&job).expect("prune old snapshots");
+        assert!(!Path::new(&history_root)
+            .join("2026-07-24_12-00-00")
+            .exists());
+        assert!(Path::new(&history_root)
+            .join("2026-07-25_12-00-00")
+            .exists());
+        assert!(Path::new(&history_root)
+            .join("2026-07-26_12-00-00")
+            .exists());
+
+        std::fs::remove_dir_all(root).expect("clean up retention test");
     }
 
     #[test]
@@ -1673,6 +2314,7 @@ mod tests {
             destination: "CloudFolder:New".into(),
             interval_minutes: 180,
             backup_mode: "incremental".into(),
+            retention_count: 7,
         };
         let updated =
             update_job_record(&connection, 1, &input).expect("update existing backup job");
@@ -1685,6 +2327,7 @@ mod tests {
         assert_eq!(updated.name, "Edited name");
         assert_eq!(updated.destination, "CloudFolder:New");
         assert_eq!(updated.interval_minutes, 180);
+        assert_eq!(updated.retention_count, 7);
         assert_eq!(run_count, 1);
 
         drop(connection);
@@ -1763,10 +2406,13 @@ mod tests {
             next_run_at: None,
             status: "ready".into(),
             last_message: None,
+            progress_percent: 0,
+            progress_message: None,
+            retention_count: 2,
             created_at: now_string(),
         };
 
-        let result = perform_copy(&job);
+        let result = perform_copy(&job, None);
         assert!(result.is_ok(), "copy failed: {result:?}");
         assert_eq!(
             std::fs::read_to_string(destination_dir.join("new.txt"))
@@ -1777,6 +2423,36 @@ mod tests {
             std::fs::read_to_string(destination_dir.join("existing.txt"))
                 .expect("read pre-existing file"),
             "must remain"
+        );
+        std::fs::write(source_dir.join("new.txt"), "updated backup content")
+            .expect("update source fixture");
+        perform_copy(&job, None).expect("perform update with safety copy");
+        let history_root = version_history_root(&job)
+            .expect("build incremental history path")
+            .strip_prefix(":local:")
+            .expect("local history path")
+            .to_owned();
+        let snapshots = std::fs::read_dir(history_root)
+            .expect("read incremental safety copies")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("collect incremental safety copies");
+        assert_eq!(snapshots.len(), 1);
+        assert_eq!(
+            std::fs::read_to_string(snapshots[0].path().join("new.txt"))
+                .expect("read retained previous content"),
+            "new backup content"
+        );
+        let restore_dir = root.join("restored");
+        std::fs::create_dir_all(&restore_dir).expect("create restore destination");
+        std::fs::write(restore_dir.join("new.txt"), "current local copy")
+            .expect("create restore name collision");
+        let snapshot_name = snapshots[0].file_name().to_string_lossy().into_owned();
+        let restored = restore_version_file_for_job(&job, &snapshot_name, "new.txt", &restore_dir)
+            .expect("restore previous content");
+        assert!(restored.path.ends_with("new (restored 1).txt"));
+        assert_eq!(
+            std::fs::read_to_string(&restored.path).expect("read restored previous content"),
+            "new backup content"
         );
 
         std::fs::remove_dir_all(root).expect("clean up copy test");
@@ -1819,10 +2495,13 @@ mod tests {
             next_run_at: None,
             status: "ready".into(),
             last_message: None,
+            progress_percent: 0,
+            progress_message: None,
+            retention_count: 0,
             created_at: now_string(),
         };
 
-        let result = perform_copy(&job);
+        let result = perform_copy(&job, None);
         assert!(result.is_ok(), "multi-source copy failed: {result:?}");
         assert_eq!(
             std::fs::read_to_string(destination.join("Documents/same-name.txt"))
@@ -1866,10 +2545,13 @@ mod tests {
             next_run_at: None,
             status: "ready".into(),
             last_message: None,
+            progress_percent: 0,
+            progress_message: None,
+            retention_count: 0,
             created_at: now_string(),
         };
 
-        let outcome = perform_copy(&job).expect("perform full backup");
+        let outcome = perform_copy(&job, None).expect("perform full backup");
         let snapshots = std::fs::read_dir(destination.join("Full"))
             .expect("read dated snapshots")
             .collect::<Result<Vec<_>, _>>()
@@ -1910,12 +2592,30 @@ mod tests {
             next_run_at: None,
             status: "ready".into(),
             last_message: None,
+            progress_percent: 0,
+            progress_message: None,
+            retention_count: 2,
             created_at: now_string(),
         };
 
-        perform_copy(&job).expect("perform mirror");
+        let history_root = version_history_root(&job)
+            .expect("build mirror history path")
+            .strip_prefix(":local:")
+            .expect("local history path")
+            .to_owned();
+        perform_copy(&job, None).expect("perform mirror");
         assert!(destination.join("keep.txt").exists());
         assert!(!destination.join("remove.txt").exists());
+        let snapshots = std::fs::read_dir(history_root)
+            .expect("read mirror safety copies")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("collect mirror safety copies");
+        assert_eq!(snapshots.len(), 1);
+        assert_eq!(
+            std::fs::read_to_string(snapshots[0].path().join("remove.txt"))
+                .expect("read retained deleted file"),
+            "remove"
+        );
 
         std::fs::remove_dir_all(root).expect("clean up mirror test");
     }
@@ -1979,6 +2679,9 @@ mod tests {
             .expect("collect migrated columns");
         assert!(columns.contains(&"backup_mode".to_string()));
         assert!(columns.contains(&"last_full_at".to_string()));
+        assert!(columns.contains(&"progress_percent".to_string()));
+        assert!(columns.contains(&"progress_message".to_string()));
+        assert!(columns.contains(&"retention_count".to_string()));
 
         drop(statement);
         drop(connection);
@@ -2013,16 +2716,19 @@ mod tests {
             next_run_at: None,
             status: "ready".into(),
             last_message: None,
+            progress_percent: 0,
+            progress_message: None,
+            retention_count: 0,
             created_at: now_string(),
         };
 
-        let baseline = perform_copy(&job).expect("create differential baseline");
+        let baseline = perform_copy(&job, None).expect("create differential baseline");
         assert!(baseline.full_completed);
         assert!(destination.join("Baseline").exists());
 
         job.last_full_at = Some((Utc::now() - Duration::minutes(1)).to_rfc3339());
         std::fs::write(source.join("changed.txt"), "changed").expect("write differential change");
-        let difference = perform_copy(&job).expect("create differential change set");
+        let difference = perform_copy(&job, None).expect("create differential change set");
         assert!(!difference.full_completed);
         let changes = std::fs::read_dir(destination.join("Differential"))
             .expect("read differential folders")

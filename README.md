@@ -6,8 +6,8 @@ CloudFolder Sync is an Ubuntu desktop application for selecting local files or
 folders and safely backing them up to Google Drive—or any cloud provider
 supported by [rclone](https://rclone.org/).
 
-The current MVP deliberately uses `rclone copy`, not `rclone sync`. It uploads
-new and changed content without deleting files that already exist in the cloud.
+Incremental backup is the safe default and never deletes existing cloud files.
+True mirroring is available as an explicitly destructive option with a warning.
 
 ## Current features
 
@@ -15,12 +15,15 @@ new and changed content without deleting files that already exist in the cloud.
 - Multiple local files and folders in a single backup job
 - Google Drive folder browser with folder creation
 - Persistent backup jobs stored in SQLite
-- User-selectable schedules from every 15 minutes to daily
+- Simple schedule presets plus exact custom minute, hour, or day intervals
+- Editable backup names, sources, destinations, and schedules
+- Full, incremental, differential, and mirroring transfer modes
 - Manual **Back up now** action
 - Google Drive and other rclone remote discovery
-- Background scheduling while the application is running
+- Always-on scheduling through a systemd user service
 - System tray behavior when the main window is closed
-- Recent run history and actionable transfer errors
+- Recent run history and a global, copyable error log
+- Automatic GitHub release checks with package-aware update downloads
 - Pause, resume, and remove jobs without deleting cloud data
 
 ## Prerequisites
@@ -97,19 +100,52 @@ npm run tauri build
 
 ## Scheduling behavior
 
-Schedules run inside the CloudFolder process. Closing the main window hides it
-to the system tray so schedules continue. Use **Quit CloudFolder** when you
-actually want to stop the scheduler.
+On the first packaged-app launch, CloudFolder installs and enables a systemd
+user service. The service starts at login, restarts if it fails, and keeps
+scheduled jobs running after the window or desktop application is closed. If
+systemd is unavailable, the app falls back to its built-in scheduler. A normal
+user service pauses when the Ubuntu user logs out; enable systemd user lingering
+separately if backups must run before login.
 
-The next implementation milestone is a separate systemd user service so
-scheduled backups can start automatically at login without first opening the
-desktop interface.
+Choose a simple preset when creating a backup, or open **More schedule options**
+to enter an exact interval in minutes, hours, or days. Open **Error log** from
+the sidebar to review the latest 100 failed runs or copy a troubleshooting
+report.
+
+To change an existing job, click its card, choose **Edit backup**, make the
+changes, and press **Save changes**. Its existing run history is kept.
+
+Backup types behave as follows:
+
+- **Full backup** creates a new dated folder containing everything on every run.
+- **Incremental backup** updates one cloud folder with new and changed files and
+  never deletes cloud-only files.
+- **Differential backup** creates a dated full baseline on its first run, then
+  dated folders containing files changed since that baseline.
+- **Mirroring** makes the destination match the computer and can delete files
+  from the selected cloud destination.
+
+## Program updates
+
+CloudFolder checks the repository's latest published GitHub Release shortly
+after startup. Use **Updates** in the sidebar to check manually, read release
+notes, and download the correct Linux package.
+
+- `.deb` installations download the new Ubuntu package and open the graphical
+  package installer for password-confirmed installation.
+- AppImage installations download an executable AppImage to `~/Downloads` and
+  open that folder.
+
+Updates are never silently installed, and download links are accepted only from
+the project's GitHub Releases.
 
 ## Safety boundaries
 
 - Only paths readable by the current Ubuntu user can be backed up.
 - Jobs never run as root.
-- The MVP never automatically deletes cloud content.
+- Full, incremental, and differential modes never delete cloud content.
+- Mirroring can delete destination files, and requires an explicit warning
+  acknowledgment before a job can be saved.
 - Removing a job only removes its local configuration and history.
 - A disconnected drive or unavailable source produces an error instead of
   modifying the destination.

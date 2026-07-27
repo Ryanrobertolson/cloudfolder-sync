@@ -51,6 +51,8 @@ struct SyncJob {
     source_paths: Vec<String>,
     destination: String,
     interval_minutes: i64,
+    backup_mode: String,
+    last_full_at: Option<String>,
     enabled: bool,
     last_run_at: Option<String>,
     next_run_at: Option<String>,
@@ -65,6 +67,7 @@ struct NewJob {
     source_paths: Vec<String>,
     destination: String,
     interval_minutes: i64,
+    backup_mode: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -78,6 +81,16 @@ struct RunRecord {
 }
 
 #[derive(Debug, Serialize)]
+struct ErrorLog {
+    id: i64,
+    job_id: i64,
+    job_name: String,
+    started_at: String,
+    finished_at: String,
+    message: String,
+}
+
+#[derive(Debug, Serialize)]
 struct CloudFolderEntry {
     name: String,
     path: String,
@@ -87,6 +100,44 @@ struct CloudFolderEntry {
 struct RcloneListItem {
     #[serde(rename = "Name")]
     name: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct GitHubRelease {
+    tag_name: String,
+    name: Option<String>,
+    body: Option<String>,
+    html_url: String,
+    published_at: Option<String>,
+    assets: Vec<GitHubAsset>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GitHubAsset {
+    name: String,
+    browser_download_url: String,
+    size: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct UpdateInfo {
+    available: bool,
+    current_version: String,
+    latest_version: String,
+    title: String,
+    notes: String,
+    release_url: String,
+    published_at: Option<String>,
+    asset_name: Option<String>,
+    download_url: Option<String>,
+    download_size: Option<u64>,
+    package_type: String,
+}
+
+#[derive(Debug, Serialize)]
+struct DownloadedUpdate {
+    path: String,
+    instructions: String,
 }
 
 fn now_string() -> String {
@@ -116,6 +167,8 @@ fn initialize_database(path: &Path) -> AppResult<()> {
             source_path      TEXT NOT NULL,
             destination      TEXT NOT NULL,
             interval_minutes INTEGER NOT NULL,
+            backup_mode      TEXT NOT NULL DEFAULT 'incremental',
+            last_full_at      TEXT,
             enabled          INTEGER NOT NULL DEFAULT 1,
             last_run_at      TEXT,
             next_run_at      TEXT,
@@ -139,11 +192,37 @@ fn initialize_database(path: &Path) -> AppResult<()> {
             ON runs(job_id, id DESC);
         ",
     )?;
+    ensure_job_column(
+        &connection,
+        "backup_mode",
+        "ALTER TABLE jobs ADD COLUMN backup_mode TEXT NOT NULL DEFAULT 'incremental'",
+    )?;
+    ensure_job_column(
+        &connection,
+        "last_full_at",
+        "ALTER TABLE jobs ADD COLUMN last_full_at TEXT",
+    )?;
+    Ok(())
+}
+
+fn reset_interrupted_jobs(path: &Path) -> AppResult<()> {
+    let connection = connect(path)?;
     connection.execute(
         "UPDATE jobs SET status = 'ready', last_message = 'Previous run was interrupted'
          WHERE status = 'running'",
         [],
     )?;
+    Ok(())
+}
+
+fn ensure_job_column(connection: &Connection, column: &str, migration: &str) -> AppResult<()> {
+    let mut statement = connection.prepare("PRAGMA table_info(jobs)")?;
+    let columns = statement
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<Result<Vec<_>, _>>()?;
+    if !columns.iter().any(|existing| existing == column) {
+        connection.execute(migration, [])?;
+    }
     Ok(())
 }
 
@@ -155,12 +234,14 @@ fn map_job(row: &rusqlite::Row<'_>) -> rusqlite::Result<SyncJob> {
         source_paths: decode_source_paths(&stored_source),
         destination: row.get(3)?,
         interval_minutes: row.get(4)?,
-        enabled: row.get::<_, i64>(5)? != 0,
-        last_run_at: row.get(6)?,
-        next_run_at: row.get(7)?,
-        status: row.get(8)?,
-        last_message: row.get(9)?,
-        created_at: row.get(10)?,
+        backup_mode: row.get(5)?,
+        last_full_at: row.get(6)?,
+        enabled: row.get::<_, i64>(7)? != 0,
+        last_run_at: row.get(8)?,
+        next_run_at: row.get(9)?,
+        status: row.get(10)?,
+        last_message: row.get(11)?,
+        created_at: row.get(12)?,
     })
 }
 
@@ -174,8 +255,9 @@ fn decode_source_paths(stored: &str) -> Vec<String> {
 fn get_job(connection: &Connection, job_id: i64) -> AppResult<SyncJob> {
     connection
         .query_row(
-            "SELECT id, name, source_path, destination, interval_minutes, enabled,
-                    last_run_at, next_run_at, status, last_message, created_at
+            "SELECT id, name, source_path, destination, interval_minutes,
+                    backup_mode, last_full_at, enabled, last_run_at, next_run_at,
+                    status, last_message, created_at
              FROM jobs WHERE id = ?1",
             [job_id],
             map_job,
@@ -191,6 +273,14 @@ fn validate_new_job(input: &NewJob) -> AppResult<()> {
     if input.interval_minutes < 1 {
         return Err(AppError::Validation(
             "The schedule must be at least one minute".into(),
+        ));
+    }
+    if !matches!(
+        input.backup_mode.as_str(),
+        "full" | "incremental" | "differential" | "mirror"
+    ) {
+        return Err(AppError::Validation(
+            "Choose a supported backup mode".into(),
         ));
     }
     if input.source_paths.is_empty() {
@@ -217,6 +307,12 @@ fn validate_new_job(input: &NewJob) -> AppResult<()> {
             return Err(AppError::Validation(format!(
                 "The selected file or folder no longer exists: {source_path}"
             )));
+        }
+        if input.backup_mode == "mirror" && source.is_file() {
+            return Err(AppError::Validation(
+                "Mirroring works with folders only. Put the file in a folder or choose another backup type."
+                    .into(),
+            ));
         }
         if !seen_paths.insert(source_path) {
             return Err(AppError::Validation(
@@ -250,8 +346,9 @@ fn validate_new_job(input: &NewJob) -> AppResult<()> {
 fn list_jobs(state: State<'_, AppState>) -> AppResult<Vec<SyncJob>> {
     let connection = connect(&state.db_path)?;
     let mut statement = connection.prepare(
-        "SELECT id, name, source_path, destination, interval_minutes, enabled,
-                last_run_at, next_run_at, status, last_message, created_at
+        "SELECT id, name, source_path, destination, interval_minutes,
+                backup_mode, last_full_at, enabled, last_run_at, next_run_at,
+                status, last_message, created_at
          FROM jobs ORDER BY created_at DESC",
     )?;
     let jobs = statement
@@ -270,19 +367,74 @@ fn create_job(input: NewJob, state: State<'_, AppState>) -> AppResult<SyncJob> {
         .map_err(|error| AppError::Validation(format!("Could not save the sources: {error}")))?;
     connection.execute(
         "INSERT INTO jobs
-            (name, source_path, destination, interval_minutes, enabled,
-             next_run_at, status, created_at)
-         VALUES (?1, ?2, ?3, ?4, 1, ?5, 'ready', ?6)",
+            (name, source_path, destination, interval_minutes, backup_mode,
+             enabled, next_run_at, status, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, 1, ?6, 'ready', ?7)",
         params![
             input.name.trim(),
             stored_sources,
             input.destination,
             input.interval_minutes,
+            input.backup_mode,
             next_run,
             created_at
         ],
     )?;
     get_job(&connection, connection.last_insert_rowid())
+}
+
+fn update_job_record(connection: &Connection, job_id: i64, input: &NewJob) -> AppResult<SyncJob> {
+    let current = get_job(connection, job_id)?;
+    let stored_sources = serde_json::to_string(&input.source_paths)
+        .map_err(|error| AppError::Validation(format!("Could not save the sources: {error}")))?;
+    let next_run = if current.enabled {
+        Some(add_minutes(input.interval_minutes))
+    } else {
+        None
+    };
+    let baseline_still_valid = current.source_paths == input.source_paths
+        && current.destination == input.destination
+        && current.backup_mode == input.backup_mode;
+    let last_full_at = baseline_still_valid
+        .then_some(current.last_full_at)
+        .flatten();
+    connection.execute(
+        "UPDATE jobs
+         SET name = ?1, source_path = ?2, destination = ?3,
+             interval_minutes = ?4, backup_mode = ?5, last_full_at = ?6,
+             next_run_at = ?7, status = ?8
+         WHERE id = ?9",
+        params![
+            input.name.trim(),
+            stored_sources,
+            input.destination,
+            input.interval_minutes,
+            input.backup_mode,
+            last_full_at,
+            next_run,
+            if current.enabled { "ready" } else { "paused" },
+            job_id
+        ],
+    )?;
+    get_job(connection, job_id)
+}
+
+#[tauri::command]
+fn update_job(job_id: i64, input: NewJob, state: State<'_, AppState>) -> AppResult<SyncJob> {
+    validate_new_job(&input)?;
+    if state
+        .running_jobs
+        .lock()
+        .map_err(|_| AppError::Transfer("The scheduler lock is unavailable".into()))?
+        .contains(&job_id)
+    {
+        return Err(AppError::Validation(
+            "Wait for this backup to finish before editing it".into(),
+        ));
+    }
+
+    let connection = connect(&state.db_path)?;
+    update_job_record(&connection, job_id, &input)
 }
 
 #[tauri::command]
@@ -353,10 +505,36 @@ fn compact_output(stdout: &[u8], stderr: &[u8]) -> String {
     }
 }
 
-fn perform_copy(job: &SyncJob) -> AppResult<String> {
+#[derive(Debug)]
+struct CopyOutcome {
+    message: String,
+    full_completed: bool,
+}
+
+fn backup_stamp() -> String {
+    Utc::now().format("%Y-%m-%d_%H-%M-%S").to_string()
+}
+
+fn perform_copy(job: &SyncJob) -> AppResult<CopyOutcome> {
     let multiple_sources = job.source_paths.len() > 1;
     let mut completed = Vec::new();
     let mut failures = Vec::new();
+    let stamp = backup_stamp();
+    let (mode_destination, full_completed) = match job.backup_mode.as_str() {
+        "full" => (
+            child_cloud_destination(&job.destination, &format!("Full/{stamp}")),
+            true,
+        ),
+        "differential" if job.last_full_at.is_none() => (
+            child_cloud_destination(&job.destination, &format!("Baseline/{stamp}")),
+            true,
+        ),
+        "differential" => (
+            child_cloud_destination(&job.destination, &format!("Differential/{stamp}")),
+            false,
+        ),
+        _ => (job.destination.clone(), false),
+    };
 
     for source_path in &job.source_paths {
         let source = Path::new(source_path);
@@ -371,34 +549,52 @@ fn perform_copy(job: &SyncJob) -> AppResult<String> {
             continue;
         }
         let destination = if multiple_sources {
-            child_cloud_destination(&job.destination, &source_name)
+            child_cloud_destination(&mode_destination, &source_name)
         } else {
-            job.destination.clone()
+            mode_destination.clone()
         };
-        let output = Command::new("rclone")
-            .arg("copy")
+        let mut command = Command::new("rclone");
+        command
+            .arg(if job.backup_mode == "mirror" {
+                "sync"
+            } else {
+                "copy"
+            })
             .arg(source_path)
-            .arg(destination)
+            .arg(&destination)
             .arg("--create-empty-src-dirs")
             .arg("--stats-one-line")
             .arg("--stats=10s")
-            .arg("--retries=3")
-            .output()
-            .map_err(|error| {
-                AppError::Transfer(format!(
-                    "Could not start rclone: {error}. Install rclone and try again."
-                ))
-            })?;
+            .arg("--retries=3");
+        if job.backup_mode == "differential" {
+            if let Some(last_full_at) = &job.last_full_at {
+                if let Ok(baseline) = chrono::DateTime::parse_from_rfc3339(last_full_at) {
+                    let age_seconds = (Utc::now() - baseline.with_timezone(&Utc))
+                        .num_seconds()
+                        .max(60)
+                        + 60;
+                    command.arg("--max-age").arg(format!("{age_seconds}s"));
+                }
+            }
+        }
+        let output = command.output().map_err(|error| {
+            AppError::Transfer(format!(
+                "Could not start rclone: {error}. Install rclone and try again."
+            ))
+        })?;
         let message = compact_output(&output.stdout, &output.stderr);
         if output.status.success() {
-            completed.push(format!("{source_name}: {message}"));
+            completed.push(format!("{source_name} → {destination}: {message}"));
         } else {
             failures.push(format!("{source_name}: {message}"));
         }
     }
 
     if failures.is_empty() {
-        Ok(completed.join("\n"))
+        Ok(CopyOutcome {
+            message: completed.join("\n"),
+            full_completed,
+        })
     } else {
         let partial_note = if completed.is_empty() {
             String::new()
@@ -438,32 +634,41 @@ async fn execute_job(job_id: i64, state: AppState) -> AppResult<RunRecord> {
         let connection = connect(&state.db_path)?;
         let job = get_job(&connection, job_id)?;
         let started_at = now_string();
-        connection.execute(
-            "UPDATE jobs SET status = 'running', last_message = NULL WHERE id = ?1",
+        let claimed = connection.execute(
+            "UPDATE jobs SET status = 'running', last_message = NULL
+             WHERE id = ?1 AND status != 'running'",
             [job_id],
         )?;
+        if claimed == 0 {
+            return Err(AppError::Validation(
+                "This backup is already running in the background".into(),
+            ));
+        }
         drop(connection);
 
         let job_for_copy = job.clone();
-        let copy_result = tauri::async_runtime::spawn_blocking(move || perform_copy(&job_for_copy))
+        let copy_result = tokio::task::spawn_blocking(move || perform_copy(&job_for_copy))
             .await
             .map_err(|error| AppError::Transfer(format!("Backup worker failed: {error}")))?;
 
         let finished_at = now_string();
-        let (status, message) = match copy_result {
-            Ok(message) => ("success", message),
-            Err(error) => ("error", error.to_string()),
+        let (status, message, full_completed) = match copy_result {
+            Ok(outcome) => ("success", outcome.message, outcome.full_completed),
+            Err(error) => ("error", error.to_string(), false),
         };
         let connection = connect(&state.db_path)?;
         connection.execute(
             "UPDATE jobs
-             SET status = ?1, last_message = ?2, last_run_at = ?3, next_run_at = ?4
-             WHERE id = ?5",
+             SET status = ?1, last_message = ?2, last_run_at = ?3,
+                 next_run_at = ?4,
+                 last_full_at = CASE WHEN ?5 = 1 THEN ?3 ELSE last_full_at END
+             WHERE id = ?6",
             params![
                 status,
                 message,
                 finished_at,
                 add_minutes(job.interval_minutes),
+                i64::from(full_completed),
                 job_id
             ],
         )?;
@@ -516,6 +721,37 @@ fn job_history(job_id: i64, state: State<'_, AppState>) -> AppResult<Vec<RunReco
         })?
         .collect::<Result<Vec<_>, _>>()?;
     Ok(runs)
+}
+
+fn query_error_logs(connection: &Connection) -> AppResult<Vec<ErrorLog>> {
+    let mut statement = connection.prepare(
+        "SELECT runs.id, runs.job_id, jobs.name, runs.started_at,
+                runs.finished_at, runs.message
+         FROM runs
+         INNER JOIN jobs ON jobs.id = runs.job_id
+         WHERE runs.status = 'error'
+         ORDER BY runs.id DESC
+         LIMIT 100",
+    )?;
+    let logs = statement
+        .query_map([], |row| {
+            Ok(ErrorLog {
+                id: row.get(0)?,
+                job_id: row.get(1)?,
+                job_name: row.get(2)?,
+                started_at: row.get(3)?,
+                finished_at: row.get(4)?,
+                message: row.get(5)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(logs)
+}
+
+#[tauri::command]
+fn list_error_logs(state: State<'_, AppState>) -> AppResult<Vec<ErrorLog>> {
+    let connection = connect(&state.db_path)?;
+    query_error_logs(&connection)
 }
 
 #[tauri::command]
@@ -803,9 +1039,337 @@ fn open_support_page() -> AppResult<()> {
         })
 }
 
+const RELEASE_API_URL: &str =
+    "https://api.github.com/repos/Ryanrobertolson/cloudfolder-sync/releases/latest";
+
+fn github_client() -> AppResult<reqwest::blocking::Client> {
+    reqwest::blocking::Client::builder()
+        .user_agent(format!("CloudFolder-Sync/{}", env!("CARGO_PKG_VERSION")))
+        .timeout(StdDuration::from_secs(30))
+        .build()
+        .map_err(|error| AppError::Transfer(format!("Could not prepare the update check: {error}")))
+}
+
+fn package_type() -> &'static str {
+    if std::env::var_os("APPIMAGE").is_some() {
+        "appimage"
+    } else {
+        "deb"
+    }
+}
+
+fn release_asset<'a>(release: &'a GitHubRelease, kind: &str) -> Option<&'a GitHubAsset> {
+    let expected_suffix = if kind == "appimage" {
+        ".AppImage"
+    } else {
+        "_amd64.deb"
+    };
+    release
+        .assets
+        .iter()
+        .find(|asset| asset.name.ends_with(expected_suffix))
+}
+
+#[tauri::command]
+fn check_for_updates() -> AppResult<UpdateInfo> {
+    let release = github_client()?
+        .get(RELEASE_API_URL)
+        .send()
+        .and_then(reqwest::blocking::Response::error_for_status)
+        .map_err(|error| {
+            AppError::Transfer(format!(
+                "CloudFolder could not check GitHub for updates: {error}"
+            ))
+        })?
+        .json::<GitHubRelease>()
+        .map_err(|error| {
+            AppError::Transfer(format!(
+                "GitHub returned an unreadable update response: {error}"
+            ))
+        })?;
+    let current = semver::Version::parse(env!("CARGO_PKG_VERSION"))
+        .map_err(|error| AppError::Validation(format!("Invalid app version: {error}")))?;
+    let latest_text = release.tag_name.trim_start_matches(['v', 'V']);
+    let latest = semver::Version::parse(latest_text).map_err(|error| {
+        AppError::Transfer(format!(
+            "The latest GitHub release has an invalid version: {error}"
+        ))
+    })?;
+    let kind = package_type();
+    let asset = release_asset(&release, kind);
+    let asset_name = asset.map(|value| value.name.clone());
+    let download_url = asset.map(|value| value.browser_download_url.clone());
+    let download_size = asset.map(|value| value.size);
+    Ok(UpdateInfo {
+        available: latest > current,
+        current_version: current.to_string(),
+        latest_version: latest.to_string(),
+        title: release
+            .name
+            .unwrap_or_else(|| format!("CloudFolder Sync {latest}")),
+        notes: release
+            .body
+            .unwrap_or_else(|| "No release notes were provided.".into()),
+        release_url: release.html_url,
+        published_at: release.published_at,
+        asset_name,
+        download_url,
+        download_size,
+        package_type: kind.into(),
+    })
+}
+
+fn downloads_directory() -> AppResult<PathBuf> {
+    let home = std::env::var_os("HOME").ok_or_else(|| {
+        AppError::Validation("CloudFolder could not find your home folder".into())
+    })?;
+    let downloads = PathBuf::from(home).join("Downloads");
+    std::fs::create_dir_all(&downloads)?;
+    Ok(downloads)
+}
+
+fn validate_update_download(download_url: &str, asset_name: &str) -> AppResult<reqwest::Url> {
+    let url = reqwest::Url::parse(download_url)
+        .map_err(|_| AppError::Validation("The update download link is invalid".into()))?;
+    if url.scheme() != "https" || url.host_str() != Some("github.com") {
+        return Err(AppError::Validation(
+            "CloudFolder only downloads updates directly from GitHub".into(),
+        ));
+    }
+    let file_name = Path::new(asset_name)
+        .file_name()
+        .and_then(|name| name.to_str());
+    if file_name != Some(asset_name)
+        || !(asset_name.ends_with("_amd64.deb") || asset_name.ends_with(".AppImage"))
+    {
+        return Err(AppError::Validation(
+            "The update has an unsupported file name".into(),
+        ));
+    }
+    Ok(url)
+}
+
+#[tauri::command]
+fn download_update(download_url: String, asset_name: String) -> AppResult<DownloadedUpdate> {
+    let url = validate_update_download(&download_url, &asset_name)?;
+    let mut response = github_client()?
+        .get(url)
+        .send()
+        .and_then(reqwest::blocking::Response::error_for_status)
+        .map_err(|error| AppError::Transfer(format!("Could not download the update: {error}")))?;
+    let expected_length = response.content_length();
+    if expected_length.unwrap_or(0) > 500 * 1024 * 1024 {
+        return Err(AppError::Validation(
+            "The update file is unexpectedly large".into(),
+        ));
+    }
+    let destination = downloads_directory()?.join(&asset_name);
+    let temporary = destination.with_file_name(format!("{asset_name}.part"));
+    let mut file = std::fs::File::create(&temporary)?;
+    let downloaded_bytes = std::io::copy(&mut response, &mut file)
+        .map_err(|error| AppError::Transfer(format!("Could not save the update: {error}")))?;
+    drop(file);
+    if expected_length.is_some_and(|length| length != downloaded_bytes) {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(AppError::Transfer(
+            "The update download stopped before it was complete".into(),
+        ));
+    }
+    std::fs::rename(&temporary, &destination)?;
+
+    if asset_name.ends_with(".AppImage") {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = std::fs::metadata(&destination)?.permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(&destination, permissions)?;
+        }
+        Command::new("xdg-open")
+            .arg(destination.parent().unwrap_or(Path::new(".")))
+            .spawn()
+            .map_err(|error| {
+                AppError::Transfer(format!("Could not open the Downloads folder: {error}"))
+            })?;
+        Ok(DownloadedUpdate {
+            path: destination.to_string_lossy().into_owned(),
+            instructions:
+                "The new AppImage is in Downloads. Close CloudFolder, then open the new AppImage."
+                    .into(),
+        })
+    } else {
+        Command::new("xdg-open")
+            .arg(&destination)
+            .spawn()
+            .map_err(|error| {
+                AppError::Transfer(format!("Could not open Ubuntu's installer: {error}"))
+            })?;
+        Ok(DownloadedUpdate {
+            path: destination.to_string_lossy().into_owned(),
+            instructions:
+                "Ubuntu's installer is open. Press Install, enter your password, then reopen CloudFolder."
+                    .into(),
+        })
+    }
+}
+
+#[tauri::command]
+fn open_release_page(release_url: String) -> AppResult<()> {
+    let url = reqwest::Url::parse(&release_url)
+        .map_err(|_| AppError::Validation("The release page link is invalid".into()))?;
+    if url.scheme() != "https" || url.host_str() != Some("github.com") {
+        return Err(AppError::Validation(
+            "CloudFolder only opens GitHub release pages".into(),
+        ));
+    }
+    Command::new("xdg-open")
+        .arg(url.as_str())
+        .spawn()
+        .map(|_| ())
+        .map_err(|error| {
+            AppError::Io(std::io::Error::new(
+                error.kind(),
+                format!("Could not open the GitHub release page: {error}"),
+            ))
+        })
+}
+
 #[tauri::command]
 fn quit_app(app: AppHandle) {
     app.exit(0);
+}
+
+#[derive(Debug, Serialize)]
+struct BackgroundServiceStatus {
+    installed: bool,
+    enabled: bool,
+    active: bool,
+    message: String,
+}
+
+fn systemd_user_directory() -> AppResult<PathBuf> {
+    if let Some(config_home) = std::env::var_os("XDG_CONFIG_HOME") {
+        return Ok(PathBuf::from(config_home).join("systemd/user"));
+    }
+    let home = std::env::var_os("HOME").ok_or_else(|| {
+        AppError::Validation("CloudFolder could not find your home folder".into())
+    })?;
+    Ok(PathBuf::from(home).join(".config/systemd/user"))
+}
+
+fn systemd_quote(value: &Path) -> String {
+    format!(
+        "\"{}\"",
+        value
+            .to_string_lossy()
+            .replace('\\', "\\\\")
+            .replace('"', "\\\"")
+    )
+}
+
+fn background_service_unit(executable: &Path, database: &Path) -> String {
+    format!(
+        "[Unit]\n\
+Description=CloudFolder background backup scheduler\n\
+Wants=network-online.target\n\
+After=network-online.target\n\n\
+[Service]\n\
+Type=simple\n\
+Environment=CLOUDFOLDER_VERSION={}\n\
+ExecStart={} --service --database {}\n\
+Restart=always\n\
+RestartSec=15\n\n\
+[Install]\n\
+WantedBy=default.target\n",
+        env!("CARGO_PKG_VERSION"),
+        systemd_quote(executable),
+        systemd_quote(database)
+    )
+}
+
+fn service_executable() -> AppResult<PathBuf> {
+    if let Some(appimage) = std::env::var_os("APPIMAGE") {
+        return Ok(PathBuf::from(appimage));
+    }
+    Ok(std::env::current_exe()?)
+}
+
+fn systemctl_success(arguments: &[&str]) -> bool {
+    Command::new("systemctl")
+        .arg("--user")
+        .args(arguments)
+        .output()
+        .map(|output| output.status.success())
+        .unwrap_or(false)
+}
+
+fn background_service_state() -> AppResult<BackgroundServiceStatus> {
+    let unit_path = systemd_user_directory()?.join("cloudfolder-sync.service");
+    let installed = unit_path.exists();
+    let enabled = systemctl_success(&["is-enabled", "cloudfolder-sync.service"]);
+    let active = systemctl_success(&["is-active", "cloudfolder-sync.service"]);
+    let message = if active {
+        "Backups continue after the app closes while you are signed in.".into()
+    } else if installed {
+        "The background service is installed but is not running.".into()
+    } else {
+        "The background service has not been installed yet.".into()
+    };
+    Ok(BackgroundServiceStatus {
+        installed,
+        enabled,
+        active,
+        message,
+    })
+}
+
+fn install_background_service(database: &Path) -> AppResult<BackgroundServiceStatus> {
+    let unit_directory = systemd_user_directory()?;
+    std::fs::create_dir_all(&unit_directory)?;
+    let unit_path = unit_directory.join("cloudfolder-sync.service");
+    let unit = background_service_unit(&service_executable()?, database);
+    let unit_changed = std::fs::read_to_string(&unit_path)
+        .map(|existing| existing.as_str() != unit.as_str())
+        .unwrap_or(true);
+    let was_active = systemctl_success(&["is-active", "cloudfolder-sync.service"]);
+    if unit_changed {
+        std::fs::write(&unit_path, unit)?;
+    }
+
+    let mut commands = Vec::new();
+    if unit_changed {
+        commands.push(vec!["daemon-reload"]);
+    }
+    commands.push(vec!["enable", "--now", "cloudfolder-sync.service"]);
+    if was_active && unit_changed {
+        commands.push(vec!["restart", "cloudfolder-sync.service"]);
+    }
+    for arguments in commands {
+        let output = Command::new("systemctl")
+            .arg("--user")
+            .args(&arguments)
+            .output()
+            .map_err(|error| {
+                AppError::Transfer(format!("Could not start the background service: {error}"))
+            })?;
+        if !output.status.success() {
+            return Err(AppError::Transfer(format!(
+                "Could not start the background service: {}",
+                compact_output(&output.stdout, &output.stderr)
+            )));
+        }
+    }
+    background_service_state()
+}
+
+#[tauri::command]
+fn background_service_status() -> AppResult<BackgroundServiceStatus> {
+    background_service_state()
+}
+
+#[tauri::command]
+fn repair_background_service(state: State<'_, AppState>) -> AppResult<BackgroundServiceStatus> {
+    install_background_service(&state.db_path)
 }
 
 fn due_job_ids(state: &AppState) -> AppResult<Vec<i64>> {
@@ -813,7 +1377,8 @@ fn due_job_ids(state: &AppState) -> AppResult<Vec<i64>> {
     let now = now_string();
     let mut statement = connection.prepare(
         "SELECT id FROM jobs
-         WHERE enabled = 1 AND next_run_at IS NOT NULL AND next_run_at <= ?1
+         WHERE enabled = 1 AND status != 'running'
+               AND next_run_at IS NOT NULL AND next_run_at <= ?1
          ORDER BY next_run_at",
     )?;
     let ids = statement
@@ -822,18 +1387,44 @@ fn due_job_ids(state: &AppState) -> AppResult<Vec<i64>> {
     Ok(ids)
 }
 
-fn start_scheduler(state: AppState) {
-    tauri::async_runtime::spawn(async move {
-        tokio::time::sleep(StdDuration::from_secs(5)).await;
-        loop {
-            if let Ok(ids) = due_job_ids(&state) {
-                for job_id in ids {
-                    let _ = execute_job(job_id, state.clone()).await;
-                }
+async fn scheduler_loop(state: AppState) {
+    tokio::time::sleep(StdDuration::from_secs(5)).await;
+    loop {
+        if let Ok(ids) = due_job_ids(&state) {
+            for job_id in ids {
+                let _ = execute_job(job_id, state.clone()).await;
             }
-            tokio::time::sleep(StdDuration::from_secs(30)).await;
         }
-    });
+        tokio::time::sleep(StdDuration::from_secs(30)).await;
+    }
+}
+
+fn start_scheduler(state: AppState) {
+    tauri::async_runtime::spawn(scheduler_loop(state));
+}
+
+fn run_service_inner(database_path: PathBuf) -> AppResult<()> {
+    if let Some(parent) = database_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    initialize_database(&database_path)?;
+    reset_interrupted_jobs(&database_path)?;
+    let state = AppState {
+        db_path: database_path,
+        running_jobs: Arc::new(Mutex::new(HashSet::new())),
+    };
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| {
+            AppError::Transfer(format!("Could not start the backup service: {error}"))
+        })?;
+    runtime.block_on(scheduler_loop(state));
+    Ok(())
+}
+
+pub fn run_service(database_path: PathBuf) -> Result<(), String> {
+    run_service_inner(database_path).map_err(|error| error.to_string())
 }
 
 fn tray_pixels() -> Vec<u8> {
@@ -876,10 +1467,26 @@ pub fn run() {
             };
             initialize_database(&state.db_path)?;
             app.manage(state.clone());
-            start_scheduler(state);
+            let service_active = if cfg!(debug_assertions) {
+                false
+            } else {
+                install_background_service(&state.db_path)
+                    .map(|status| status.active)
+                    .unwrap_or(false)
+            };
+            if !service_active {
+                reset_interrupted_jobs(&state.db_path)?;
+                start_scheduler(state);
+            }
 
             let show = MenuItem::with_id(app, "show", "Open CloudFolder", true, None::<&str>)?;
-            let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
+            let quit = MenuItem::with_id(
+                app,
+                "quit",
+                "Close app (backups stay on)",
+                true,
+                None::<&str>,
+            )?;
             let menu = Menu::with_items(app, &[&show, &quit])?;
             TrayIconBuilder::new()
                 .tooltip("CloudFolder Sync")
@@ -912,16 +1519,23 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             list_jobs,
             create_job,
+            update_job,
             set_job_enabled,
             delete_job,
             run_job,
             job_history,
+            list_error_logs,
             list_remotes,
             connect_google_drive,
             list_cloud_folders,
             create_cloud_folder,
             open_rclone_config,
             open_support_page,
+            background_service_status,
+            repair_background_service,
+            check_for_updates,
+            download_update,
+            open_release_page,
             quit_app
         ])
         .run(tauri::generate_context!())
@@ -940,6 +1554,7 @@ mod tests {
             source_paths: vec!["Documents".into()],
             destination: "drive:Backups".into(),
             interval_minutes: 60,
+            backup_mode: "incremental".into(),
         };
         assert!(validate_new_job(&input).is_err());
     }
@@ -951,8 +1566,25 @@ mod tests {
             source_paths: vec![std::env::temp_dir().to_string_lossy().into_owned()],
             destination: "Backups".into(),
             interval_minutes: 60,
+            backup_mode: "incremental".into(),
         };
         assert!(validate_new_job(&input).is_err());
+    }
+
+    #[test]
+    fn mirroring_rejects_individual_files() {
+        let file_path =
+            std::env::temp_dir().join(format!("cloudfolder-mirror-file-{}", std::process::id()));
+        std::fs::write(&file_path, "file").expect("create mirror file fixture");
+        let input = NewJob {
+            name: "Single file mirror".into(),
+            source_paths: vec![file_path.to_string_lossy().into_owned()],
+            destination: "drive:Backups".into(),
+            interval_minutes: 60,
+            backup_mode: "mirror".into(),
+        };
+        assert!(validate_new_job(&input).is_err());
+        std::fs::remove_file(file_path).expect("clean up mirror file fixture");
     }
 
     #[test]
@@ -961,6 +1593,102 @@ mod tests {
             compact_output(b"", b""),
             "Backup completed; no files needed uploading"
         );
+    }
+
+    #[test]
+    fn error_log_only_returns_failed_runs() {
+        let connection = Connection::open_in_memory().expect("open test database");
+        connection
+            .execute_batch(
+                "
+                CREATE TABLE jobs (
+                    id INTEGER PRIMARY KEY,
+                    name TEXT NOT NULL
+                );
+                CREATE TABLE runs (
+                    id INTEGER PRIMARY KEY,
+                    job_id INTEGER NOT NULL,
+                    started_at TEXT NOT NULL,
+                    finished_at TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    message TEXT NOT NULL
+                );
+                INSERT INTO jobs (id, name) VALUES (1, 'Documents');
+                INSERT INTO runs
+                    (id, job_id, started_at, finished_at, status, message)
+                VALUES
+                    (1, 1, 'start-one', 'finish-one', 'success', 'All good'),
+                    (2, 1, 'start-two', 'finish-two', 'error', 'Drive offline');
+                ",
+            )
+            .expect("create error log fixtures");
+
+        let logs = query_error_logs(&connection).expect("query error logs");
+        assert_eq!(logs.len(), 1);
+        assert_eq!(logs[0].job_name, "Documents");
+        assert_eq!(logs[0].message, "Drive offline");
+    }
+
+    #[test]
+    fn editing_a_job_keeps_its_run_history() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock should be after the Unix epoch")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "cloudfolder-edit-test-{}-{unique}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).expect("create edit test directory");
+        let database_path = root.join("cloudfolder.sqlite3");
+        initialize_database(&database_path).expect("initialize test database");
+        let connection = connect(&database_path).expect("open test database");
+        connection
+            .execute(
+                "INSERT INTO jobs
+                    (id, name, source_path, destination, interval_minutes,
+                     enabled, next_run_at, status, created_at)
+                 VALUES (1, 'Old name', ?1, 'CloudFolder:Old', 60,
+                         1, ?2, 'ready', ?3)",
+                params![
+                    serde_json::to_string(&vec![root.to_string_lossy().into_owned()])
+                        .expect("encode source"),
+                    add_minutes(60),
+                    now_string()
+                ],
+            )
+            .expect("insert job");
+        connection
+            .execute(
+                "INSERT INTO runs
+                    (job_id, started_at, finished_at, status, message)
+                 VALUES (1, 'start', 'finish', 'success', 'Done')",
+                [],
+            )
+            .expect("insert run history");
+
+        let input = NewJob {
+            name: "Edited name".into(),
+            source_paths: vec![root.to_string_lossy().into_owned()],
+            destination: "CloudFolder:New".into(),
+            interval_minutes: 180,
+            backup_mode: "incremental".into(),
+        };
+        let updated =
+            update_job_record(&connection, 1, &input).expect("update existing backup job");
+        let run_count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM runs WHERE job_id = 1", [], |row| {
+                row.get(0)
+            })
+            .expect("count run history");
+
+        assert_eq!(updated.name, "Edited name");
+        assert_eq!(updated.destination, "CloudFolder:New");
+        assert_eq!(updated.interval_minutes, 180);
+        assert_eq!(run_count, 1);
+
+        drop(connection);
+        std::fs::remove_dir_all(root).expect("clean up edit test");
     }
 
     #[test]
@@ -1028,6 +1756,8 @@ mod tests {
             source_paths: vec![source_dir.to_string_lossy().into_owned()],
             destination: format!(":local:{}", destination_dir.display()),
             interval_minutes: 60,
+            backup_mode: "incremental".into(),
+            last_full_at: None,
             enabled: true,
             last_run_at: None,
             next_run_at: None,
@@ -1082,6 +1812,8 @@ mod tests {
             ],
             destination: format!(":local:{}", destination.display()),
             interval_minutes: 60,
+            backup_mode: "incremental".into(),
+            last_full_at: None,
             enabled: true,
             last_run_at: None,
             next_run_at: None,
@@ -1104,5 +1836,252 @@ mod tests {
         );
 
         std::fs::remove_dir_all(root).expect("clean up multi-source test");
+    }
+
+    #[test]
+    fn full_backup_creates_a_dated_snapshot() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock should be after the Unix epoch")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "cloudfolder-full-test-{}-{unique}",
+            std::process::id()
+        ));
+        let source = root.join("source");
+        let destination = root.join("destination");
+        std::fs::create_dir_all(&source).expect("create full source");
+        std::fs::create_dir_all(&destination).expect("create full destination");
+        std::fs::write(source.join("photo.jpg"), "snapshot content").expect("write full fixture");
+        let job = SyncJob {
+            id: 3,
+            name: "Full snapshot".into(),
+            source_paths: vec![source.to_string_lossy().into_owned()],
+            destination: format!(":local:{}", destination.display()),
+            interval_minutes: 1440,
+            backup_mode: "full".into(),
+            last_full_at: None,
+            enabled: true,
+            last_run_at: None,
+            next_run_at: None,
+            status: "ready".into(),
+            last_message: None,
+            created_at: now_string(),
+        };
+
+        let outcome = perform_copy(&job).expect("perform full backup");
+        let snapshots = std::fs::read_dir(destination.join("Full"))
+            .expect("read dated snapshots")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("collect dated snapshots");
+        assert!(outcome.full_completed);
+        assert_eq!(snapshots.len(), 1);
+        assert!(snapshots[0].path().join("photo.jpg").exists());
+
+        std::fs::remove_dir_all(root).expect("clean up full test");
+    }
+
+    #[test]
+    fn mirroring_removes_files_missing_from_the_source() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock should be after the Unix epoch")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "cloudfolder-mirror-test-{}-{unique}",
+            std::process::id()
+        ));
+        let source = root.join("source");
+        let destination = root.join("destination");
+        std::fs::create_dir_all(&source).expect("create mirror source");
+        std::fs::create_dir_all(&destination).expect("create mirror destination");
+        std::fs::write(source.join("keep.txt"), "keep").expect("write mirror source");
+        std::fs::write(destination.join("remove.txt"), "remove").expect("write extra mirror file");
+        let job = SyncJob {
+            id: 4,
+            name: "Mirror".into(),
+            source_paths: vec![source.to_string_lossy().into_owned()],
+            destination: format!(":local:{}", destination.display()),
+            interval_minutes: 60,
+            backup_mode: "mirror".into(),
+            last_full_at: None,
+            enabled: true,
+            last_run_at: None,
+            next_run_at: None,
+            status: "ready".into(),
+            last_message: None,
+            created_at: now_string(),
+        };
+
+        perform_copy(&job).expect("perform mirror");
+        assert!(destination.join("keep.txt").exists());
+        assert!(!destination.join("remove.txt").exists());
+
+        std::fs::remove_dir_all(root).expect("clean up mirror test");
+    }
+
+    #[test]
+    fn systemd_unit_uses_headless_mode_and_quotes_paths() {
+        let unit = background_service_unit(
+            Path::new("/opt/CloudFolder Sync/cloudfolder-sync"),
+            Path::new("/home/ryan/My Data/cloudfolder.sqlite3"),
+        );
+        assert!(unit.contains("ExecStart=\"/opt/CloudFolder Sync/cloudfolder-sync\" --service"));
+        assert!(unit.contains("--database \"/home/ryan/My Data/cloudfolder.sqlite3\""));
+        assert!(unit.contains(&format!(
+            "Environment=CLOUDFOLDER_VERSION={}",
+            env!("CARGO_PKG_VERSION")
+        )));
+        assert!(unit.contains("Restart=always"));
+    }
+
+    #[test]
+    fn old_databases_gain_backup_mode_columns() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock should be after the Unix epoch")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "cloudfolder-migration-test-{}-{unique}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).expect("create migration directory");
+        let database_path = root.join("old.sqlite3");
+        let connection = connect(&database_path).expect("open old database");
+        connection
+            .execute_batch(
+                "CREATE TABLE jobs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT NOT NULL,
+                    source_path TEXT NOT NULL,
+                    destination TEXT NOT NULL,
+                    interval_minutes INTEGER NOT NULL,
+                    enabled INTEGER NOT NULL DEFAULT 1,
+                    last_run_at TEXT,
+                    next_run_at TEXT,
+                    status TEXT NOT NULL DEFAULT 'ready',
+                    last_message TEXT,
+                    created_at TEXT NOT NULL
+                );",
+            )
+            .expect("create old jobs table");
+        drop(connection);
+
+        initialize_database(&database_path).expect("migrate old database");
+        let connection = connect(&database_path).expect("open migrated database");
+        let mut statement = connection
+            .prepare("PRAGMA table_info(jobs)")
+            .expect("inspect migrated columns");
+        let columns = statement
+            .query_map([], |row| row.get::<_, String>(1))
+            .expect("query migrated columns")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("collect migrated columns");
+        assert!(columns.contains(&"backup_mode".to_string()));
+        assert!(columns.contains(&"last_full_at".to_string()));
+
+        drop(statement);
+        drop(connection);
+        std::fs::remove_dir_all(root).expect("clean up migration test");
+    }
+
+    #[test]
+    fn differential_backup_creates_a_baseline_then_dated_changes() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock should be after the Unix epoch")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "cloudfolder-differential-test-{}-{unique}",
+            std::process::id()
+        ));
+        let source = root.join("source");
+        let destination = root.join("destination");
+        std::fs::create_dir_all(&source).expect("create differential source");
+        std::fs::create_dir_all(&destination).expect("create differential destination");
+        std::fs::write(source.join("original.txt"), "baseline").expect("write baseline fixture");
+        let mut job = SyncJob {
+            id: 5,
+            name: "Differential".into(),
+            source_paths: vec![source.to_string_lossy().into_owned()],
+            destination: format!(":local:{}", destination.display()),
+            interval_minutes: 60,
+            backup_mode: "differential".into(),
+            last_full_at: None,
+            enabled: true,
+            last_run_at: None,
+            next_run_at: None,
+            status: "ready".into(),
+            last_message: None,
+            created_at: now_string(),
+        };
+
+        let baseline = perform_copy(&job).expect("create differential baseline");
+        assert!(baseline.full_completed);
+        assert!(destination.join("Baseline").exists());
+
+        job.last_full_at = Some((Utc::now() - Duration::minutes(1)).to_rfc3339());
+        std::fs::write(source.join("changed.txt"), "changed").expect("write differential change");
+        let difference = perform_copy(&job).expect("create differential change set");
+        assert!(!difference.full_completed);
+        let changes = std::fs::read_dir(destination.join("Differential"))
+            .expect("read differential folders")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("collect differential folders");
+        assert_eq!(changes.len(), 1);
+        assert!(changes[0].path().join("changed.txt").exists());
+
+        std::fs::remove_dir_all(root).expect("clean up differential test");
+    }
+
+    #[test]
+    fn updater_selects_the_matching_linux_package() {
+        let release = GitHubRelease {
+            tag_name: "v0.6.0".into(),
+            name: Some("CloudFolder 0.6.0".into()),
+            body: None,
+            html_url: "https://github.com/Ryanrobertolson/cloudfolder-sync/releases/tag/v0.6.0"
+                .into(),
+            published_at: None,
+            assets: vec![
+                GitHubAsset {
+                    name: "CloudFolder Sync_0.6.0_amd64.deb".into(),
+                    browser_download_url: "https://github.com/deb".into(),
+                    size: 10,
+                },
+                GitHubAsset {
+                    name: "CloudFolder Sync_0.6.0_amd64.AppImage".into(),
+                    browser_download_url: "https://github.com/appimage".into(),
+                    size: 20,
+                },
+            ],
+        };
+        assert!(release_asset(&release, "deb")
+            .expect("find deb")
+            .name
+            .ends_with("_amd64.deb"));
+        assert!(release_asset(&release, "appimage")
+            .expect("find appimage")
+            .name
+            .ends_with(".AppImage"));
+    }
+
+    #[test]
+    fn updater_rejects_non_github_and_unsafe_downloads() {
+        assert!(validate_update_download(
+            "https://github.com/Ryanrobertolson/cloudfolder-sync/releases/download/v0.6.0/app.deb",
+            "CloudFolder Sync_0.6.0_amd64.deb"
+        )
+        .is_ok());
+        assert!(validate_update_download(
+            "https://example.com/fake.deb",
+            "CloudFolder Sync_0.6.0_amd64.deb"
+        )
+        .is_err());
+        assert!(validate_update_download(
+            "https://github.com/Ryanrobertolson/cloudfolder-sync/releases/download/v0.6.0/app.deb",
+            "../unsafe_amd64.deb"
+        )
+        .is_err());
     }
 }

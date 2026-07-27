@@ -3,6 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 
 type JobStatus = "ready" | "running" | "success" | "error" | "paused";
+type BackupMode = "full" | "incremental" | "differential" | "mirror";
 type CloudSetupStatus =
   | "ready"
   | "connecting"
@@ -16,6 +17,8 @@ interface SyncJob {
   source_paths: string[];
   destination: string;
   interval_minutes: number;
+  backup_mode: BackupMode;
+  last_full_at: string | null;
   enabled: boolean;
   last_run_at: string | null;
   next_run_at: string | null;
@@ -33,12 +36,59 @@ interface RunRecord {
   message: string;
 }
 
+interface ErrorLog {
+  id: number;
+  job_id: number;
+  job_name: string;
+  started_at: string;
+  finished_at: string;
+  message: string;
+}
+
+interface BackgroundServiceStatus {
+  installed: boolean;
+  enabled: boolean;
+  active: boolean;
+  message: string;
+}
+
+interface UpdateInfo {
+  available: boolean;
+  current_version: string;
+  latest_version: string;
+  title: string;
+  notes: string;
+  release_url: string;
+  published_at: string | null;
+  asset_name: string | null;
+  download_url: string | null;
+  download_size: number | null;
+  package_type: "deb" | "appimage";
+}
+
+interface DownloadedUpdate {
+  path: string;
+  instructions: string;
+}
+
+type UpdaterStatus =
+  | "idle"
+  | "checking"
+  | "current"
+  | "available"
+  | "downloading"
+  | "ready"
+  | "error";
+
+type IntervalUnit = "minutes" | "hours" | "days";
+
 interface JobDraft {
   name: string;
   source_paths: string[];
   remote: string;
   cloud_path: string | null;
   interval_minutes: number;
+  backup_mode: BackupMode;
 }
 
 interface CloudFolderEntry {
@@ -52,6 +102,7 @@ const initialDraft: JobDraft = {
   remote: "",
   cloud_path: null,
   interval_minutes: 60,
+  backup_mode: "incremental",
 };
 
 function formatTime(value: string | null): string {
@@ -73,6 +124,16 @@ function formatInterval(minutes: number): string {
   return `Every ${minutes} minutes`;
 }
 
+function intervalMultiplier(unit: IntervalUnit): number {
+  if (unit === "hours") return 60;
+  if (unit === "days") return 1440;
+  return 1;
+}
+
+function intervalValue(minutes: number, unit: IntervalUnit): number {
+  return Math.max(1, Math.round(minutes / intervalMultiplier(unit)));
+}
+
 function shortPath(path: string): string {
   if (path.length <= 46) return path;
   return `…${path.slice(-45)}`;
@@ -84,11 +145,24 @@ function sourceSummary(paths: string[]): string {
   return `${paths.length} files and folders`;
 }
 
+function backupModeLabel(mode: BackupMode): string {
+  if (mode === "full") return "Full backup";
+  if (mode === "differential") return "Differential backup";
+  if (mode === "mirror") return "Mirroring";
+  return "Incremental backup";
+}
+
+function formatFileSize(bytes: number | null): string {
+  if (!bytes) return "";
+  return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
+}
+
 export default function App() {
   const [jobs, setJobs] = useState<SyncJob[]>([]);
   const [remotes, setRemotes] = useState<string[]>([]);
   const [draft, setDraft] = useState<JobDraft>(initialDraft);
   const [showCreate, setShowCreate] = useState(false);
+  const [editingJob, setEditingJob] = useState<SyncJob | null>(null);
   const [showCloudSetup, setShowCloudSetup] = useState(false);
   const [cloudSetupStatus, setCloudSetupStatus] =
     useState<CloudSetupStatus>("ready");
@@ -100,6 +174,26 @@ export default function App() {
   const [notice, setNotice] = useState<string | null>(null);
   const [selectedJob, setSelectedJob] = useState<SyncJob | null>(null);
   const [runs, setRuns] = useState<RunRecord[]>([]);
+  const [showErrorLog, setShowErrorLog] = useState(false);
+  const [errorLogs, setErrorLogs] = useState<ErrorLog[]>([]);
+  const [errorLogsLoading, setErrorLogsLoading] = useState(false);
+  const [serviceStatus, setServiceStatus] = useState<BackgroundServiceStatus>({
+    installed: false,
+    enabled: false,
+    active: false,
+    message: "Checking the background service…",
+  });
+  const [showUpdater, setShowUpdater] = useState(false);
+  const [updaterStatus, setUpdaterStatus] = useState<UpdaterStatus>("idle");
+  const [updateInfo, setUpdateInfo] = useState<UpdateInfo | null>(null);
+  const [downloadedUpdate, setDownloadedUpdate] =
+    useState<DownloadedUpdate | null>(null);
+  const [updaterError, setUpdaterError] = useState<string | null>(null);
+  const [showAdvancedSchedule, setShowAdvancedSchedule] = useState(false);
+  const [mirrorAcknowledged, setMirrorAcknowledged] = useState(false);
+  const [customInterval, setCustomInterval] = useState(1);
+  const [customIntervalUnit, setCustomIntervalUnit] =
+    useState<IntervalUnit>("hours");
   const [showFolderBrowser, setShowFolderBrowser] = useState(false);
   const [folderBrowserPath, setFolderBrowserPath] = useState("");
   const [cloudFolders, setCloudFolders] = useState<CloudFolderEntry[]>([]);
@@ -111,15 +205,22 @@ export default function App() {
 
   const refresh = useCallback(async () => {
     try {
-      const [nextJobs, nextRemotes] = await Promise.all([
+      const [nextJobs, nextRemotes, nextErrorLogs, nextServiceStatus] =
+        await Promise.all([
         invoke<SyncJob[]>("list_jobs"),
         invoke<string[]>("list_remotes"),
-      ]);
-      setJobs(nextJobs);
-      setRemotes(nextRemotes);
+        invoke<ErrorLog[]>("list_error_logs"),
+          invoke<BackgroundServiceStatus>("background_service_status"),
+        ]);
+      const safeJobs = nextJobs ?? [];
+      const safeRemotes = nextRemotes ?? [];
+      setJobs(safeJobs);
+      setRemotes(safeRemotes);
+      setErrorLogs(nextErrorLogs ?? []);
+      if (nextServiceStatus) setServiceStatus(nextServiceStatus);
       setDraft((current) => ({
         ...current,
-        remote: current.remote || nextRemotes[0] || "",
+        remote: current.remote || safeRemotes[0] || "",
       }));
       setError(null);
     } catch (reason) {
@@ -134,6 +235,11 @@ export default function App() {
     const timer = window.setInterval(() => void refresh(), 15_000);
     return () => window.clearInterval(timer);
   }, [refresh]);
+
+  useEffect(() => {
+    const timer = window.setTimeout(() => void checkForUpdates(false), 5_000);
+    return () => window.clearTimeout(timer);
+  }, []);
 
   const activeJobs = useMemo(
     () => jobs.filter((job) => job.enabled).length,
@@ -163,23 +269,115 @@ export default function App() {
     }));
   }
 
-  async function createJob(event: React.FormEvent) {
+  function setAdvancedInterval(value: number, unit = customIntervalUnit) {
+    const safeValue = Math.max(1, Math.floor(value || 1));
+    setCustomInterval(safeValue);
+    setDraft((current) => ({
+      ...current,
+      interval_minutes: safeValue * intervalMultiplier(unit),
+    }));
+  }
+
+  function setAdvancedIntervalUnit(unit: IntervalUnit) {
+    setCustomIntervalUnit(unit);
+    setDraft((current) => ({
+      ...current,
+      interval_minutes: customInterval * intervalMultiplier(unit),
+    }));
+  }
+
+  function toggleAdvancedSchedule() {
+    if (!showAdvancedSchedule) {
+      const unit: IntervalUnit =
+        draft.interval_minutes % 1440 === 0
+          ? "days"
+          : draft.interval_minutes % 60 === 0
+            ? "hours"
+            : "minutes";
+      setCustomIntervalUnit(unit);
+      setCustomInterval(intervalValue(draft.interval_minutes, unit));
+    }
+    setShowAdvancedSchedule((current) => !current);
+  }
+
+  function setScheduleEditor(intervalMinutes: number) {
+    const unit: IntervalUnit =
+      intervalMinutes % 1440 === 0
+        ? "days"
+        : intervalMinutes % 60 === 0
+          ? "hours"
+          : "minutes";
+    setCustomIntervalUnit(unit);
+    setCustomInterval(intervalValue(intervalMinutes, unit));
+    setShowAdvancedSchedule(
+      ![15, 30, 60, 180, 360, 720, 1440].includes(intervalMinutes),
+    );
+  }
+
+  function openNewJob() {
+    setEditingJob(null);
+    setDraft({ ...initialDraft, remote: remotes[0] || "" });
+    setScheduleEditor(initialDraft.interval_minutes);
+    setMirrorAcknowledged(false);
+    setShowCreate(true);
+  }
+
+  function openEditJob(job: SyncJob) {
+    const matchingRemote = remotes.find((remote) =>
+      job.destination.startsWith(remote),
+    );
+    const colonIndex = job.destination.indexOf(":");
+    const remote =
+      matchingRemote ||
+      (colonIndex >= 0 ? job.destination.slice(0, colonIndex + 1) : "");
+    setEditingJob(job);
+    setDraft({
+      name: job.name,
+      source_paths: [...job.source_paths],
+      remote,
+      cloud_path: job.destination.slice(remote.length),
+      interval_minutes: job.interval_minutes,
+      backup_mode: job.backup_mode,
+    });
+    setScheduleEditor(job.interval_minutes);
+    setMirrorAcknowledged(job.backup_mode === "mirror");
+    setSelectedJob(null);
+    setShowCreate(true);
+  }
+
+  function closeJobForm() {
+    setShowCreate(false);
+    setEditingJob(null);
+  }
+
+  async function saveJob(event: React.FormEvent) {
     event.preventDefault();
     setSaving(true);
     setError(null);
     try {
       const cleanCloudPath = (draft.cloud_path ?? "").replace(/^\/+/, "");
-      await invoke<SyncJob>("create_job", {
-        input: {
-          name: draft.name,
-          source_paths: draft.source_paths,
-          destination: `${draft.remote}${cleanCloudPath}`,
-          interval_minutes: Number(draft.interval_minutes),
-        },
+      const input = {
+        name: draft.name,
+        source_paths: draft.source_paths,
+        destination: `${draft.remote}${cleanCloudPath}`,
+        interval_minutes: Number(draft.interval_minutes),
+        backup_mode: draft.backup_mode,
+      };
+      await invoke<SyncJob>(editingJob ? "update_job" : "create_job", {
+        ...(editingJob ? { jobId: editingJob.id } : {}),
+        input,
       });
+      const successMessage = editingJob
+        ? `${draft.name.trim()} was updated.`
+        : "Backup job created. It will run on its schedule.";
       setDraft({ ...initialDraft, remote: remotes[0] || "" });
+      setShowAdvancedSchedule(false);
+      setCustomInterval(1);
+      setCustomIntervalUnit("hours");
+      setMirrorAcknowledged(false);
       setShowCreate(false);
-      setNotice("Backup job created. It will run on its schedule.");
+      setEditingJob(null);
+      setNotice(successMessage);
       await refresh();
     } catch (reason) {
       setError(String(reason));
@@ -301,6 +499,103 @@ export default function App() {
     }
   }
 
+  async function openErrorLog() {
+    setShowErrorLog(true);
+    setErrorLogsLoading(true);
+    try {
+      setErrorLogs((await invoke<ErrorLog[]>("list_error_logs")) ?? []);
+    } catch (reason) {
+      setError(String(reason));
+    } finally {
+      setErrorLogsLoading(false);
+    }
+  }
+
+  async function copyErrorReport() {
+    const report = errorLogs
+      .map(
+        (entry) =>
+          `[${entry.finished_at}] ${entry.job_name}\n${entry.message}`,
+      )
+      .join("\n\n");
+    try {
+      await navigator.clipboard.writeText(report);
+      setNotice("The error report was copied. You can paste it into a message.");
+    } catch {
+      setError("CloudFolder could not copy the error report.");
+    }
+  }
+
+  async function repairBackgroundService() {
+    try {
+      const status = await invoke<BackgroundServiceStatus>(
+        "repair_background_service",
+      );
+      setServiceStatus(status);
+      setNotice("Background backups are now running automatically.");
+    } catch (reason) {
+      setError(String(reason));
+    }
+  }
+
+  async function checkForUpdates(showResult = true) {
+    if (showResult) setShowUpdater(true);
+    setUpdaterStatus("checking");
+    setUpdaterError(null);
+    setDownloadedUpdate(null);
+    try {
+      const info = await invoke<UpdateInfo>("check_for_updates");
+      if (!info) {
+        if (showResult) {
+          setUpdaterStatus("error");
+          setUpdaterError("CloudFolder could not read the update information.");
+        } else {
+          setUpdaterStatus("idle");
+        }
+        return;
+      }
+      setUpdateInfo(info);
+      setUpdaterStatus(info.available ? "available" : "current");
+      if (info.available) setShowUpdater(true);
+    } catch (reason) {
+      if (showResult) {
+        setUpdaterStatus("error");
+        setUpdaterError(String(reason));
+      } else {
+        setUpdaterStatus("idle");
+      }
+    }
+  }
+
+  async function downloadAvailableUpdate() {
+    if (!updateInfo?.download_url || !updateInfo.asset_name) return;
+    setUpdaterStatus("downloading");
+    setUpdaterError(null);
+    try {
+      const downloaded = await invoke<DownloadedUpdate>("download_update", {
+        downloadUrl: updateInfo.download_url,
+        assetName: updateInfo.asset_name,
+      });
+      setDownloadedUpdate(downloaded);
+      setUpdaterStatus("ready");
+    } catch (reason) {
+      setUpdaterStatus("error");
+      setUpdaterError(String(reason));
+    }
+  }
+
+  async function openUpdateReleasePage() {
+    if (!updateInfo) return;
+    try {
+      await invoke("open_release_page", {
+        releaseUrl: updateInfo.release_url,
+      });
+    } catch (reason) {
+      setUpdaterStatus("error");
+      setUpdaterError(String(reason));
+    }
+  }
+
   function configureCloud() {
     const alreadyConnected = remotes.includes("CloudFolder:");
     setCloudSetupStatus(alreadyConnected ? "success" : "ready");
@@ -363,13 +658,24 @@ export default function App() {
           <button className="nav-item" onClick={() => configureCloud()}>
             <span>☁</span> Google Drive
           </button>
+          <button className="nav-item" onClick={() => void openErrorLog()}>
+            <span>!</span> Error log
+            {errorLogs.length > 0 && <b>{errorLogs.length}</b>}
+          </button>
+          <button
+            className="nav-item"
+            onClick={() => void checkForUpdates(true)}
+          >
+            <span>↓</span> Updates
+            {updateInfo?.available && <b>New</b>}
+          </button>
         </nav>
 
         <div className="safety-note">
           <span className="shield">✓</span>
           <div>
-            <strong>Safe backup mode</strong>
-            <p>Cloud files are never automatically deleted.</p>
+            <strong>Safe by default</strong>
+            <p>Only Mirroring can delete cloud files, after a warning.</p>
           </div>
         </div>
 
@@ -383,7 +689,7 @@ export default function App() {
         </button>
 
         <button className="quit-link" onClick={() => void invoke("quit_app")}>
-          Quit CloudFolder
+          Close app — backups stay on
         </button>
       </aside>
 
@@ -393,7 +699,7 @@ export default function App() {
             <p className="eyebrow">This computer</p>
             <h1>Your backups</h1>
           </div>
-          <button className="primary" onClick={() => setShowCreate(true)}>
+          <button className="primary" onClick={openNewJob}>
             <span>＋</span> New backup
           </button>
         </header>
@@ -422,6 +728,31 @@ export default function App() {
               <small>System status</small>
             </div>
           </article>
+        </section>
+
+        <section
+          className={`background-service-card ${
+            serviceStatus.active ? "active" : "inactive"
+          }`}
+          aria-label="Background backup service"
+        >
+          <span aria-hidden="true">{serviceStatus.active ? "✓" : "!"}</span>
+          <div>
+            <strong>
+              {serviceStatus.active
+                ? "Background backups are running"
+                : "Background backups need attention"}
+            </strong>
+            <p>{serviceStatus.message}</p>
+          </div>
+          {!serviceStatus.active && (
+            <button
+              className="secondary"
+              onClick={() => void repairBackgroundService()}
+            >
+              Turn on background backups
+            </button>
+          )}
         </section>
 
         {error && (
@@ -460,7 +791,7 @@ export default function App() {
           <div className="section-heading">
             <div>
               <h2>Backup jobs</h2>
-              <p>Files are checked automatically while CloudFolder is running.</p>
+              <p>Files are checked automatically, even while this window is closed.</p>
             </div>
             <button className="refresh" onClick={() => void refresh()}>
               ↻ Refresh
@@ -474,7 +805,7 @@ export default function App() {
               <span>＋</span>
               <h3>No backups yet</h3>
               <p>Choose a folder or file and protect it with an automatic schedule.</p>
-              <button className="primary" onClick={() => setShowCreate(true)}>
+              <button className="primary" onClick={openNewJob}>
                 Create your first backup
               </button>
             </div>
@@ -501,6 +832,7 @@ export default function App() {
                         </p>
                         <div className="job-meta">
                           <span>☁ {job.destination}</span>
+                          <span>▣ {backupModeLabel(job.backup_mode)}</span>
                           <span>◷ {formatInterval(job.interval_minutes)}</span>
                           <span>
                             {job.last_run_at
@@ -690,7 +1022,7 @@ export default function App() {
       )}
 
       {showCreate && (
-        <div className="modal-backdrop" onMouseDown={() => setShowCreate(false)}>
+        <div className="modal-backdrop" onMouseDown={closeJobForm}>
           <section
             className="modal"
             role="dialog"
@@ -698,17 +1030,22 @@ export default function App() {
             aria-labelledby="create-title"
             onMouseDown={(event) => event.stopPropagation()}
           >
-            <button className="modal-close" onClick={() => setShowCreate(false)}>
+            <button className="modal-close" onClick={closeJobForm}>
               ×
             </button>
-            <p className="eyebrow">New scheduled backup</p>
-            <h2 id="create-title">Protect something important</h2>
+            <p className="eyebrow">
+              {editingJob ? "Edit scheduled backup" : "New scheduled backup"}
+            </p>
+            <h2 id="create-title">
+              {editingJob ? "Update this backup" : "Protect something important"}
+            </h2>
             <p className="modal-intro">
-              CloudFolder uploads new and changed files. It will not delete existing
-              cloud files.
+              {editingJob
+                ? "Change what is backed up, where it goes, or how often it runs."
+                : "Choose a safe backup type below. CloudFolder warns before any option can delete cloud files."}
             </p>
 
-            <form onSubmit={createJob}>
+            <form onSubmit={saveJob}>
               <label>
                 Backup name
                 <input
@@ -777,6 +1114,11 @@ export default function App() {
                     <option value="" disabled>
                       Choose an account
                     </option>
+                    {draft.remote && !remotes.includes(draft.remote) && (
+                      <option value={draft.remote}>
+                        {draft.remote.replace(/:$/, "")}
+                      </option>
+                    )}
                     {remotes.map((remote) => (
                       <option value={remote} key={remote}>
                         {remote.replace(/:$/, "")}
@@ -816,32 +1158,162 @@ export default function App() {
                 </button>
               )}
 
-              <label>
-                Run automatically
-                <select
-                  value={draft.interval_minutes}
-                  onChange={(event) =>
-                    setDraft({
-                      ...draft,
-                      interval_minutes: Number(event.target.value),
-                    })
-                  }
+              <fieldset className="backup-mode-fieldset">
+                <legend>Backup type</legend>
+                <div className="backup-mode-grid">
+                  {([
+                    [
+                      "full",
+                      "Full backup",
+                      "Save a new dated copy of everything each time.",
+                    ],
+                    [
+                      "incremental",
+                      "Incremental backup",
+                      "Safely upload only new and changed files.",
+                    ],
+                    [
+                      "differential",
+                      "Differential backup",
+                      "Keep a full baseline, then dated changes since it.",
+                    ],
+                    [
+                      "mirror",
+                      "Mirroring",
+                      "Make a cloud folder exactly match a local folder.",
+                    ],
+                  ] as const).map(([mode, title, description]) => (
+                    <label
+                      className={`backup-mode-card ${
+                        draft.backup_mode === mode ? "selected" : ""
+                      } ${mode === "mirror" ? "destructive" : ""}`}
+                      key={mode}
+                    >
+                      <input
+                        type="radio"
+                        name="backup-mode"
+                        value={mode}
+                        checked={draft.backup_mode === mode}
+                        onChange={() => {
+                          setDraft({ ...draft, backup_mode: mode });
+                          if (mode !== "mirror") setMirrorAcknowledged(false);
+                        }}
+                      />
+                      <span aria-hidden="true">
+                        {mode === "full"
+                          ? "▣"
+                          : mode === "incremental"
+                            ? "＋"
+                            : mode === "differential"
+                              ? "◫"
+                              : "⇄"}
+                      </span>
+                      <strong>{title}</strong>
+                      <small>{description}</small>
+                    </label>
+                  ))}
+                </div>
+                {draft.backup_mode === "mirror" && (
+                  <label className="mirror-warning">
+                    <input
+                      type="checkbox"
+                      checked={mirrorAcknowledged}
+                      onChange={(event) =>
+                        setMirrorAcknowledged(event.target.checked)
+                      }
+                    />
+                    <span>
+                      <strong>Mirroring can delete cloud files.</strong>
+                      I understand that cloud files missing from this computer
+                      will be removed from the selected destination. Mirroring
+                      works with folders, not individual files.
+                    </span>
+                  </label>
+                )}
+              </fieldset>
+
+              <fieldset className="schedule-fieldset">
+                <legend>Run automatically</legend>
+                {!showAdvancedSchedule ? (
+                  <select
+                    aria-label="Backup schedule"
+                    value={draft.interval_minutes}
+                    onChange={(event) =>
+                      setDraft({
+                        ...draft,
+                        interval_minutes: Number(event.target.value),
+                      })
+                    }
+                  >
+                    <option value={15}>Every 15 minutes</option>
+                    <option value={30}>Every 30 minutes</option>
+                    <option value={60}>Every hour</option>
+                    <option value={180}>Every 3 hours</option>
+                    <option value={360}>Every 6 hours</option>
+                    <option value={720}>Every 12 hours</option>
+                    <option value={1440}>Every day</option>
+                  </select>
+                ) : (
+                  <div className="advanced-schedule">
+                    <div className="advanced-schedule-row">
+                      <span>Run every</span>
+                      <input
+                        aria-label="Custom schedule amount"
+                        type="number"
+                        min={1}
+                        max={
+                          customIntervalUnit === "days"
+                            ? 30
+                            : customIntervalUnit === "hours"
+                              ? 168
+                              : 10080
+                        }
+                        value={customInterval}
+                        onChange={(event) =>
+                          setAdvancedInterval(Number(event.target.value))
+                        }
+                      />
+                      <select
+                        aria-label="Custom schedule unit"
+                        value={customIntervalUnit}
+                        onChange={(event) =>
+                          setAdvancedIntervalUnit(
+                            event.target.value as IntervalUnit,
+                          )
+                        }
+                      >
+                        <option value="minutes">minutes</option>
+                        <option value="hours">hours</option>
+                        <option value="days">days</option>
+                      </select>
+                    </div>
+                    <div className="schedule-summary">
+                      <span aria-hidden="true">◷</span>
+                      <p>
+                        <strong>{formatInterval(draft.interval_minutes)}</strong>
+                        <small>
+                          The next backup is scheduled after each run finishes.
+                        </small>
+                      </p>
+                    </div>
+                  </div>
+                )}
+                <button
+                  type="button"
+                  className="advanced-schedule-toggle"
+                  onClick={toggleAdvancedSchedule}
                 >
-                  <option value={15}>Every 15 minutes</option>
-                  <option value={30}>Every 30 minutes</option>
-                  <option value={60}>Every hour</option>
-                  <option value={180}>Every 3 hours</option>
-                  <option value={360}>Every 6 hours</option>
-                  <option value={720}>Every 12 hours</option>
-                  <option value={1440}>Every day</option>
-                </select>
-              </label>
+                  {showAdvancedSchedule
+                    ? "Use simple schedule choices"
+                    : "More schedule options"}
+                </button>
+              </fieldset>
 
               <div className="modal-actions">
                 <button
                   type="button"
                   className="secondary"
-                  onClick={() => setShowCreate(false)}
+                  onClick={closeJobForm}
                 >
                   Cancel
                 </button>
@@ -852,10 +1324,17 @@ export default function App() {
                     draft.source_paths.length === 0 ||
                     !draft.remote ||
                     draft.cloud_path === null ||
-                    !draft.name.trim()
+                    !draft.name.trim() ||
+                    (draft.backup_mode === "mirror" && !mirrorAcknowledged)
                   }
                 >
-                  {saving ? "Creating…" : "Create backup"}
+                  {saving
+                    ? editingJob
+                      ? "Saving…"
+                      : "Creating…"
+                    : editingJob
+                      ? "Save changes"
+                      : "Create backup"}
                 </button>
               </div>
             </form>
@@ -1018,6 +1497,239 @@ export default function App() {
         </div>
       )}
 
+      {showUpdater && (
+        <div
+          className="modal-backdrop"
+          onMouseDown={() => {
+            if (updaterStatus !== "downloading") setShowUpdater(false);
+          }}
+        >
+          <section
+            className="modal updater-modal"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="updater-title"
+            onMouseDown={(event) => event.stopPropagation()}
+          >
+            {updaterStatus !== "downloading" && (
+              <button
+                className="modal-close"
+                aria-label="Close updater"
+                onClick={() => setShowUpdater(false)}
+              >
+                ×
+              </button>
+            )}
+            <div className="updater-heading">
+              <div className="updater-icon" aria-hidden="true">↓</div>
+              <div>
+                <p className="eyebrow">CloudFolder updater</p>
+                <h2 id="updater-title">
+                  {updaterStatus === "available"
+                    ? "A new version is ready"
+                    : updaterStatus === "current"
+                      ? "CloudFolder is up to date"
+                      : updaterStatus === "ready"
+                        ? "The update is downloaded"
+                        : updaterStatus === "error"
+                          ? "Update check needs help"
+                          : "Checking for updates"}
+                </h2>
+              </div>
+            </div>
+
+            {updaterStatus === "checking" ||
+            updaterStatus === "downloading" ? (
+              <div className="updater-progress">
+                <span className="tiny-spinner" />
+                <strong>
+                  {updaterStatus === "downloading"
+                    ? "Downloading the update…"
+                    : "Asking GitHub for the latest release…"}
+                </strong>
+                <small>
+                  {updaterStatus === "downloading"
+                    ? "Keep CloudFolder open until the download finishes."
+                    : "This usually takes only a moment."}
+                </small>
+              </div>
+            ) : updaterStatus === "available" && updateInfo ? (
+              <>
+                <div className="version-change">
+                  <span>Installed: v{updateInfo.current_version}</span>
+                  <b aria-hidden="true">→</b>
+                  <strong>New: v{updateInfo.latest_version}</strong>
+                </div>
+                <div className="release-notes">
+                  <strong>{updateInfo.title}</strong>
+                  <pre>{updateInfo.notes}</pre>
+                </div>
+                <div className="update-package-note">
+                  <span aria-hidden="true">⬡</span>
+                  <p>
+                    <strong>
+                      {updateInfo.package_type === "deb"
+                        ? "Ubuntu installer"
+                        : "Portable AppImage"}
+                    </strong>
+                    <small>
+                      {updateInfo.asset_name || "Release download"}{" "}
+                      {formatFileSize(updateInfo.download_size)}
+                    </small>
+                  </p>
+                </div>
+                <div className="updater-actions">
+                  <button
+                    className="secondary"
+                    onClick={() => void openUpdateReleasePage()}
+                  >
+                    View on GitHub
+                  </button>
+                  {updateInfo.download_url && updateInfo.asset_name ? (
+                    <button
+                      className="primary"
+                      onClick={() => void downloadAvailableUpdate()}
+                    >
+                      Download update
+                    </button>
+                  ) : (
+                    <button
+                      className="primary"
+                      onClick={() => void openUpdateReleasePage()}
+                    >
+                      Open release
+                    </button>
+                  )}
+                </div>
+              </>
+            ) : updaterStatus === "ready" && downloadedUpdate ? (
+              <div className="update-ready">
+                <span aria-hidden="true">✓</span>
+                <strong>Ready for the last step</strong>
+                <p>{downloadedUpdate.instructions}</p>
+                <code>{downloadedUpdate.path}</code>
+                <button
+                  className="primary"
+                  onClick={() => setShowUpdater(false)}
+                >
+                  Got it
+                </button>
+              </div>
+            ) : updaterStatus === "current" && updateInfo ? (
+              <div className="update-current">
+                <span aria-hidden="true">✓</span>
+                <strong>You have version {updateInfo.current_version}</strong>
+                <p>No newer published GitHub release was found.</p>
+                <button
+                  className="secondary"
+                  onClick={() => void checkForUpdates(true)}
+                >
+                  Check again
+                </button>
+              </div>
+            ) : (
+              <div className="update-error">
+                <span aria-hidden="true">!</span>
+                <strong>CloudFolder could not check for an update.</strong>
+                <p>{updaterError}</p>
+                <button
+                  className="primary"
+                  onClick={() => void checkForUpdates(true)}
+                >
+                  Try again
+                </button>
+              </div>
+            )}
+          </section>
+        </div>
+      )}
+
+      {showErrorLog && (
+        <div className="modal-backdrop" onMouseDown={() => setShowErrorLog(false)}>
+          <section
+            className="modal error-log-modal"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="error-log-title"
+            onMouseDown={(event) => event.stopPropagation()}
+          >
+            <button
+              className="modal-close"
+              aria-label="Close error log"
+              onClick={() => setShowErrorLog(false)}
+            >
+              ×
+            </button>
+            <div className="error-log-heading">
+              <div className="error-log-icon" aria-hidden="true">!</div>
+              <div>
+                <p className="eyebrow">Troubleshooting</p>
+                <h2 id="error-log-title">Error log</h2>
+                <p>
+                  Backup failures stay here with their time and full error message.
+                </p>
+              </div>
+            </div>
+
+            <div className="error-log-toolbar">
+              <span>
+                {errorLogs.length === 0
+                  ? "No errors saved"
+                  : `${errorLogs.length} saved ${
+                      errorLogs.length === 1 ? "error" : "errors"
+                    }`}
+              </span>
+              <div>
+                <button
+                  className="secondary"
+                  onClick={() => void openErrorLog()}
+                  disabled={errorLogsLoading}
+                >
+                  {errorLogsLoading ? "Checking…" : "Refresh"}
+                </button>
+                <button
+                  className="primary"
+                  onClick={() => void copyErrorReport()}
+                  disabled={errorLogs.length === 0}
+                >
+                  Copy error report
+                </button>
+              </div>
+            </div>
+
+            <div className="error-log-list">
+              {errorLogsLoading && errorLogs.length === 0 ? (
+                <div className="error-log-empty">Looking for errors…</div>
+              ) : errorLogs.length === 0 ? (
+                <div className="error-log-empty">
+                  <span aria-hidden="true">✓</span>
+                  <strong>Everything looks good</strong>
+                  <p>Failed backup runs will appear here automatically.</p>
+                </div>
+              ) : (
+                errorLogs.map((entry) => (
+                  <article key={entry.id}>
+                    <header>
+                      <div>
+                        <span className="status-dot error" />
+                        <strong>{entry.job_name}</strong>
+                      </div>
+                      <time dateTime={entry.finished_at}>
+                        {formatTime(entry.finished_at)}
+                      </time>
+                    </header>
+                    <pre>{entry.message}</pre>
+                  </article>
+                ))
+              )}
+            </div>
+            <p className="error-log-footnote">
+              CloudFolder keeps the latest 100 backup errors on this computer.
+            </p>
+          </section>
+        </div>
+      )}
+
       {selectedJob && (
         <div className="modal-backdrop" onMouseDown={() => setSelectedJob(null)}>
           <section
@@ -1045,6 +1757,14 @@ export default function App() {
                 <dd>{selectedJob.destination}</dd>
               </div>
               <div>
+                <dt>Schedule</dt>
+                <dd>{formatInterval(selectedJob.interval_minutes)}</dd>
+              </div>
+              <div>
+                <dt>Backup type</dt>
+                <dd>{backupModeLabel(selectedJob.backup_mode)}</dd>
+              </div>
+              <div>
                 <dt>Next run</dt>
                 <dd>{formatTime(selectedJob.next_run_at)}</dd>
               </div>
@@ -1066,11 +1786,22 @@ export default function App() {
                 ))
               )}
             </div>
-            <div className="danger-row">
-              <button className="danger" onClick={() => void removeJob(selectedJob)}>
-                Remove backup job
+            <div className="job-detail-actions">
+              <button
+                className="secondary"
+                onClick={() => openEditJob(selectedJob)}
+              >
+                Edit backup
               </button>
-              <small>Files already in the cloud will remain there.</small>
+              <div className="danger-row">
+                <button
+                  className="danger"
+                  onClick={() => void removeJob(selectedJob)}
+                >
+                  Remove backup job
+                </button>
+                <small>Cloud files will remain there.</small>
+              </div>
             </div>
           </section>
         </div>

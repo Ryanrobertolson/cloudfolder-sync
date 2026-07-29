@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 
@@ -45,6 +45,24 @@ interface ErrorLog {
   job_name: string;
   started_at: string;
   finished_at: string;
+  message: string;
+}
+
+type ActivityState =
+  | "preparing"
+  | "scanning"
+  | "copying"
+  | "retrying"
+  | "waiting"
+  | "success"
+  | "error"
+  | "info";
+
+interface ActivityLogEntry {
+  id: number;
+  job_id: number;
+  occurred_at: string;
+  state: ActivityState;
   message: string;
 }
 
@@ -178,6 +196,25 @@ function formatFileSize(bytes: number | null): string {
   return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
 }
 
+function formatLogTime(value: string): string {
+  return new Intl.DateTimeFormat(undefined, {
+    hour: "numeric",
+    minute: "2-digit",
+    second: "2-digit",
+  }).format(new Date(value));
+}
+
+function activityStateLabel(state: ActivityState): string {
+  if (state === "preparing") return "Preparing";
+  if (state === "scanning") return "Scanning";
+  if (state === "copying") return "Copying";
+  if (state === "retrying") return "Retrying";
+  if (state === "waiting") return "Waiting";
+  if (state === "success") return "Finished";
+  if (state === "error") return "Problem";
+  return "Info";
+}
+
 export default function App() {
   const [jobs, setJobs] = useState<SyncJob[]>([]);
   const [remotes, setRemotes] = useState<string[]>([]);
@@ -195,6 +232,13 @@ export default function App() {
   const [notice, setNotice] = useState<string | null>(null);
   const [selectedJob, setSelectedJob] = useState<SyncJob | null>(null);
   const [runs, setRuns] = useState<RunRecord[]>([]);
+  const [activityJob, setActivityJob] = useState<SyncJob | null>(null);
+  const [activityEntries, setActivityEntries] = useState<ActivityLogEntry[]>([]);
+  const [activityLoading, setActivityLoading] = useState(false);
+  const [activityError, setActivityError] = useState<string | null>(null);
+  const [activityAutoScroll, setActivityAutoScroll] = useState(true);
+  const [activityNow, setActivityNow] = useState(Date.now());
+  const activityLogRef = useRef<HTMLDivElement | null>(null);
   const [versionJob, setVersionJob] = useState<SyncJob | null>(null);
   const [versionSnapshots, setVersionSnapshots] = useState<VersionSnapshot[]>(
     [],
@@ -269,6 +313,23 @@ export default function App() {
     }
   }, []);
 
+  const refreshActivity = useCallback(
+    async (jobId: number, showLoading = false) => {
+      if (showLoading) setActivityLoading(true);
+      try {
+        setActivityEntries(
+          (await invoke<ActivityLogEntry[]>("job_activity", { jobId })) ?? [],
+        );
+        setActivityError(null);
+      } catch (reason) {
+        setActivityError(String(reason));
+      } finally {
+        if (showLoading) setActivityLoading(false);
+      }
+    },
+    [],
+  );
+
   useEffect(() => {
     void refresh();
     const timer = window.setInterval(() => void refresh(), 15_000);
@@ -286,6 +347,26 @@ export default function App() {
   );
   const hasRunningJob =
     runningIds.size > 0 || jobs.some((job) => job.status === "running");
+  const currentActivityJob = activityJob
+    ? (jobs.find((job) => job.id === activityJob.id) ?? activityJob)
+    : null;
+  const activityIsRunning = Boolean(
+    currentActivityJob &&
+      (currentActivityJob.status === "running" ||
+        runningIds.has(currentActivityJob.id)),
+  );
+  const lastActivity = activityEntries.at(-1) ?? null;
+  const secondsSinceActivity = lastActivity
+    ? Math.max(
+        0,
+        Math.floor(
+          (activityNow - new Date(lastActivity.occurred_at).getTime()) / 1_000,
+        ),
+      )
+    : 0;
+  const activityMayBeStalled = Boolean(
+    activityIsRunning && lastActivity && secondsSinceActivity >= 60,
+  );
 
   useEffect(() => {
     const timer = window.setInterval(
@@ -294,6 +375,27 @@ export default function App() {
     );
     return () => window.clearInterval(timer);
   }, [hasRunningJob, refreshJobs]);
+
+  useEffect(() => {
+    if (!activityJob) return;
+    void refreshActivity(activityJob.id);
+    const timer = window.setInterval(
+      () => void refreshActivity(activityJob.id),
+      activityIsRunning ? 750 : 3_000,
+    );
+    return () => window.clearInterval(timer);
+  }, [activityIsRunning, activityJob, refreshActivity]);
+
+  useEffect(() => {
+    if (!activityJob) return;
+    const timer = window.setInterval(() => setActivityNow(Date.now()), 1_000);
+    return () => window.clearInterval(timer);
+  }, [activityJob]);
+
+  useEffect(() => {
+    if (!activityAutoScroll || !activityLogRef.current) return;
+    activityLogRef.current.scrollTop = activityLogRef.current.scrollHeight;
+  }, [activityAutoScroll, activityEntries]);
 
   async function chooseSource(directory: boolean) {
     const selected = await open({ directory, multiple: true });
@@ -547,6 +649,39 @@ export default function App() {
       setRuns(await invoke<RunRecord[]>("job_history", { jobId: job.id }));
     } catch (reason) {
       setError(String(reason));
+    }
+  }
+
+  async function openActivityLog(job: SyncJob) {
+    setSelectedJob(null);
+    setActivityJob(job);
+    setActivityEntries([]);
+    setActivityError(null);
+    setActivityAutoScroll(true);
+    setActivityNow(Date.now());
+    await refreshActivity(job.id, true);
+  }
+
+  function closeActivityLog() {
+    setActivityJob(null);
+    setActivityEntries([]);
+    setActivityError(null);
+    setActivityAutoScroll(true);
+  }
+
+  async function copyActivityLog() {
+    if (activityEntries.length === 0) return;
+    const text = activityEntries
+      .map(
+        (entry) =>
+          `[${entry.occurred_at}] ${activityStateLabel(entry.state).toUpperCase()} ${entry.message}`,
+      )
+      .join("\n");
+    try {
+      await navigator.clipboard.writeText(text);
+      setNotice("Activity log copied.");
+    } catch (reason) {
+      setActivityError(`Could not copy the log: ${String(reason)}`);
     }
   }
 
@@ -998,26 +1133,34 @@ export default function App() {
                         <span />
                       </label>
                       {isRunning ? (
-                        <div
-                          className="backup-progress"
-                          role="progressbar"
-                          aria-label={`Backing up ${job.name}`}
-                          aria-valuemin={0}
-                          aria-valuemax={100}
-                          aria-valuenow={progressPercent}
-                        >
-                          <div className="backup-progress-copy">
-                            <small>
-                              {job.progress_message ??
-                                `Backing up ${job.name}`}
-                            </small>
-                            <strong>{progressPercent}%</strong>
+                        <div className="running-job-controls">
+                          <div
+                            className="backup-progress"
+                            role="progressbar"
+                            aria-label={`Backing up ${job.name}`}
+                            aria-valuemin={0}
+                            aria-valuemax={100}
+                            aria-valuenow={progressPercent}
+                          >
+                            <div className="backup-progress-copy">
+                              <small>
+                                {job.progress_message ??
+                                  `Backing up ${job.name}`}
+                              </small>
+                              <strong>{progressPercent}%</strong>
+                            </div>
+                            <div className="backup-progress-track">
+                              <span
+                                style={{ width: `${progressPercent}%` }}
+                              />
+                            </div>
                           </div>
-                          <div className="backup-progress-track">
-                            <span
-                              style={{ width: `${progressPercent}%` }}
-                            />
-                          </div>
+                          <button
+                            className="activity-link"
+                            onClick={() => void openActivityLog(job)}
+                          >
+                            View activity
+                          </button>
                         </div>
                       ) : (
                         <button
@@ -2086,6 +2229,152 @@ export default function App() {
         </div>
       )}
 
+      {activityJob && currentActivityJob && (
+        <div className="modal-backdrop" onMouseDown={closeActivityLog}>
+          <section
+            className="modal activity-modal"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="activity-title"
+            onMouseDown={(event) => event.stopPropagation()}
+          >
+            <button className="modal-close" onClick={closeActivityLog}>
+              ×
+            </button>
+            <div className="activity-heading">
+              <span
+                className={`activity-icon ${
+                  activityMayBeStalled
+                    ? "stalled"
+                    : activityIsRunning
+                      ? "working"
+                      : lastActivity?.state === "error"
+                        ? "error"
+                        : "finished"
+                }`}
+                aria-hidden="true"
+              >
+                <span>
+                  {activityMayBeStalled
+                    ? "!"
+                    : activityIsRunning
+                      ? "↻"
+                      : lastActivity?.state === "error"
+                        ? "×"
+                        : "✓"}
+                </span>
+              </span>
+              <div>
+                <p className="eyebrow">Backup activity</p>
+                <h2 id="activity-title">{currentActivityJob.name}</h2>
+              </div>
+            </div>
+
+            <div
+              className={`activity-health ${
+                activityMayBeStalled ? "stalled" : ""
+              }`}
+            >
+              <strong>
+                {activityMayBeStalled
+                  ? `No new message for ${secondsSinceActivity} seconds`
+                  : activityIsRunning
+                    ? "Your backup is working"
+                    : lastActivity?.state === "error"
+                      ? "This backup needs attention"
+                      : lastActivity?.state === "success"
+                        ? "Your backup finished"
+                        : "Here is the latest backup activity"}
+              </strong>
+              <p>
+                {activityMayBeStalled
+                  ? "It may be scanning a large folder or waiting for the cloud. This is a warning, not proof that it is stuck."
+                  : lastActivity?.message ??
+                    "Messages will appear here when this backup starts."}
+              </p>
+            </div>
+
+            <div className="activity-toolbar">
+              <div>
+                <strong>{activityEntries.length} messages</strong>
+                <small>
+                  {lastActivity
+                    ? `Latest at ${formatLogTime(lastActivity.occurred_at)}`
+                    : "Waiting for the first message"}
+                </small>
+              </div>
+              <div className="activity-toolbar-actions">
+                <button
+                  className="secondary"
+                  onClick={() => setActivityAutoScroll((current) => !current)}
+                >
+                  {activityAutoScroll ? "Pause scrolling" : "Follow newest"}
+                </button>
+                <button
+                  className="secondary"
+                  disabled={activityLoading}
+                  onClick={() =>
+                    void refreshActivity(currentActivityJob.id, true)
+                  }
+                >
+                  {activityLoading ? "Refreshing…" : "Refresh"}
+                </button>
+                <button
+                  className="secondary"
+                  disabled={activityEntries.length === 0}
+                  onClick={() => void copyActivityLog()}
+                >
+                  Copy log
+                </button>
+              </div>
+            </div>
+
+            {activityError && (
+              <div className="inline-error activity-error">{activityError}</div>
+            )}
+
+            <div
+              className="activity-log-stream"
+              ref={activityLogRef}
+              role="log"
+              aria-live="polite"
+            >
+              {activityLoading && activityEntries.length === 0 ? (
+                <div className="activity-empty">
+                  <span className="tiny-spinner" />
+                  <strong>Opening the activity log…</strong>
+                </div>
+              ) : activityEntries.length === 0 ? (
+                <div className="activity-empty">
+                  <span aria-hidden="true">☁</span>
+                  <strong>No activity yet</strong>
+                  <p>Start this backup and its messages will show up here.</p>
+                </div>
+              ) : (
+                activityEntries.map((entry) => (
+                  <article
+                    className={`activity-entry ${entry.state}`}
+                    key={entry.id}
+                  >
+                    <time dateTime={entry.occurred_at}>
+                      {formatLogTime(entry.occurred_at)}
+                    </time>
+                    <span className="activity-state">
+                      {activityStateLabel(entry.state)}
+                    </span>
+                    <p>{entry.message}</p>
+                  </article>
+                ))
+              )}
+            </div>
+            <p className="activity-retention-note">
+              The newest 500 messages from the latest run are kept, even after
+              the app closes.
+            </p>
+          </section>
+        </div>
+      )}
+
       {selectedJob && (
         <div className="modal-backdrop" onMouseDown={() => setSelectedJob(null)}>
           <section
@@ -2155,6 +2444,12 @@ export default function App() {
             </div>
             <div className="job-detail-actions">
               <div className="job-detail-safe-actions">
+                <button
+                  className="secondary activity-button"
+                  onClick={() => void openActivityLog(selectedJob)}
+                >
+                  Activity log
+                </button>
                 <button
                   className="secondary"
                   onClick={() => openEditJob(selectedJob)}

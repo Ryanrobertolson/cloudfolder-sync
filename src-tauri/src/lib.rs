@@ -96,6 +96,15 @@ struct ErrorLog {
 }
 
 #[derive(Debug, Serialize)]
+struct ActivityLogEntry {
+    id: i64,
+    job_id: i64,
+    occurred_at: String,
+    state: String,
+    message: String,
+}
+
+#[derive(Debug, Serialize)]
 struct CloudFolderEntry {
     name: String,
     path: String,
@@ -187,6 +196,7 @@ fn add_minutes(minutes: i64) -> String {
 fn connect(path: &Path) -> AppResult<Connection> {
     let connection = Connection::open(path)?;
     connection.busy_timeout(StdDuration::from_secs(5))?;
+    connection.pragma_update(None, "foreign_keys", "ON")?;
     Ok(connection)
 }
 
@@ -225,10 +235,20 @@ fn initialize_database(path: &Path) -> AppResult<()> {
             message     TEXT NOT NULL
         );
 
+        CREATE TABLE IF NOT EXISTS backup_activity (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            job_id      INTEGER NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+            occurred_at TEXT NOT NULL,
+            state       TEXT NOT NULL,
+            message     TEXT NOT NULL
+        );
+
         CREATE INDEX IF NOT EXISTS idx_jobs_due
             ON jobs(enabled, next_run_at);
         CREATE INDEX IF NOT EXISTS idx_runs_job
             ON runs(job_id, id DESC);
+        CREATE INDEX IF NOT EXISTS idx_backup_activity_job
+            ON backup_activity(job_id, id DESC);
         ",
     )?;
     ensure_job_column(
@@ -262,11 +282,40 @@ fn initialize_database(path: &Path) -> AppResult<()> {
 fn reset_interrupted_jobs(path: &Path) -> AppResult<()> {
     let connection = connect(path)?;
     connection.execute(
+        "INSERT INTO backup_activity (job_id, occurred_at, state, message)
+         SELECT id, ?1, 'error',
+                'The previous backup stopped before it could finish.'
+         FROM jobs WHERE status = 'running'",
+        [now_string()],
+    )?;
+    connection.execute(
         "UPDATE jobs
          SET status = 'ready', last_message = 'Previous run was interrupted',
              progress_percent = 0, progress_message = NULL
          WHERE status = 'running'",
         [],
+    )?;
+    Ok(())
+}
+
+fn record_activity(
+    connection: &Connection,
+    job_id: i64,
+    state: &str,
+    message: &str,
+) -> AppResult<()> {
+    connection.execute(
+        "INSERT INTO backup_activity (job_id, occurred_at, state, message)
+         VALUES (?1, ?2, ?3, ?4)",
+        params![job_id, now_string(), state, message],
+    )?;
+    connection.execute(
+        "DELETE FROM backup_activity
+         WHERE job_id = ?1 AND id NOT IN (
+             SELECT id FROM backup_activity
+             WHERE job_id = ?1 ORDER BY id DESC LIMIT 500
+         )",
+        [job_id],
     )?;
     Ok(())
 }
@@ -748,6 +797,13 @@ impl ProgressReporter {
             params![percent.clamp(0, 100), message, self.job_id],
         );
     }
+
+    fn activity(&self, state: &str, message: &str) {
+        let Ok(connection) = connect(&self.db_path) else {
+            return;
+        };
+        let _ = record_activity(&connection, self.job_id, state, message);
+    }
 }
 
 fn rclone_progress_percent(line: &str) -> Option<i64> {
@@ -757,6 +813,46 @@ fn rclone_progress_percent(line: &str) -> Option<i64> {
             .and_then(|value| value.parse::<i64>().ok())
             .map(|value| value.clamp(0, 100))
     })
+}
+
+fn clean_rclone_log_line(line: &str) -> String {
+    let trimmed = line.trim();
+    for level in ["DEBUG", "INFO", "NOTICE", "WARNING", "ERROR"] {
+        if let Some(level_index) = trimmed.find(level) {
+            let after_level = &trimmed[level_index + level.len()..];
+            return after_level.trim_start_matches([' ', ':']).trim().to_owned();
+        }
+    }
+    trimmed.to_owned()
+}
+
+fn activity_state_for_line(line: &str, has_progress: bool) -> &'static str {
+    if has_progress {
+        return "copying";
+    }
+    let lowercase = line.to_lowercase();
+    if lowercase.contains("retry") || lowercase.contains("low level retry") {
+        "retrying"
+    } else if lowercase.contains("error") || lowercase.contains("failed") {
+        "error"
+    } else if lowercase.contains("waiting")
+        || lowercase.contains("rate limit")
+        || lowercase.contains("pacer")
+    {
+        "waiting"
+    } else if lowercase.contains("listing")
+        || lowercase.contains("checking")
+        || lowercase.contains("scanning")
+    {
+        "scanning"
+    } else if lowercase.contains("copied")
+        || lowercase.contains("moved")
+        || lowercase.contains("deleted")
+    {
+        "copying"
+    } else {
+        "info"
+    }
 }
 
 fn source_progress_message(source_name: &str, source_number: usize, source_count: usize) -> String {
@@ -789,6 +885,9 @@ fn perform_copy(job: &SyncJob, progress: Option<&ProgressReporter>) -> AppResult
         _ => (job.destination.clone(), false),
     };
     if supports_previous_files(job) {
+        if let Some(progress) = progress {
+            progress.activity("preparing", "Preparing the Previous files safety folder.");
+        }
         ensure_version_history(job)?;
     }
 
@@ -801,15 +900,22 @@ fn perform_copy(job: &SyncJob, progress: Option<&ProgressReporter>) -> AppResult
         let progress_message =
             source_progress_message(&source_name, source_index + 1, source_count);
         if let Some(progress) = progress {
+            progress.activity(
+                "scanning",
+                &format!("Checking {source_name} for files that need backing up."),
+            );
             progress.report(
                 ((source_index * 100) / source_count.max(1)) as i64,
                 &progress_message,
             );
         }
         if !source.exists() {
-            failures.push(format!(
-                "{source_name}: source is unavailable; reconnect its drive and try again"
-            ));
+            let message =
+                format!("{source_name}: source is unavailable; reconnect its drive and try again");
+            if let Some(progress) = progress {
+                progress.activity("error", &message);
+            }
+            failures.push(message);
             continue;
         }
         let destination = if multiple_sources {
@@ -830,6 +936,7 @@ fn perform_copy(job: &SyncJob, progress: Option<&ProgressReporter>) -> AppResult
             .arg("--stats-one-line")
             .arg("--stats=1s")
             .arg("--stats-log-level=NOTICE")
+            .arg("--log-level=INFO")
             .arg("--retries=3")
             .stdout(Stdio::null())
             .stderr(Stdio::piped());
@@ -858,6 +965,12 @@ fn perform_copy(job: &SyncJob, progress: Option<&ProgressReporter>) -> AppResult
                 "Could not start rclone: {error}. Install rclone and try again."
             ))
         })?;
+        if let Some(progress) = progress {
+            progress.activity(
+                "copying",
+                &format!("Cloud connection opened for {source_name}."),
+            );
+        }
         let stderr = child.stderr.take().ok_or_else(|| {
             AppError::Transfer("CloudFolder could not read rclone progress".into())
         })?;
@@ -865,7 +978,9 @@ fn perform_copy(job: &SyncJob, progress: Option<&ProgressReporter>) -> AppResult
         for line in BufReader::new(stderr).lines() {
             match line {
                 Ok(line) => {
-                    if let Some(source_percent) = rclone_progress_percent(&line) {
+                    let source_percent = rclone_progress_percent(&line);
+                    let clean_line = clean_rclone_log_line(&line);
+                    if let Some(source_percent) = source_percent {
                         let overall_percent = (((source_index as f64
                             + source_percent as f64 / 100.0)
                             / source_count.max(1) as f64)
@@ -873,12 +988,28 @@ fn perform_copy(job: &SyncJob, progress: Option<&ProgressReporter>) -> AppResult
                             .round() as i64;
                         if let Some(progress) = progress {
                             progress.report(overall_percent.min(99), &progress_message);
+                            progress.activity(
+                                activity_state_for_line(&line, true),
+                                &format!("{source_name}: {clean_line}"),
+                            );
                         }
                     } else if !line.trim().is_empty() {
+                        if let Some(progress) = progress {
+                            progress.activity(
+                                activity_state_for_line(&line, false),
+                                &format!("{source_name}: {clean_line}"),
+                            );
+                        }
                         messages.push(line);
                     }
                 }
-                Err(error) => messages.push(format!("Could not read transfer details: {error}")),
+                Err(error) => {
+                    let message = format!("Could not read transfer details: {error}");
+                    if let Some(progress) = progress {
+                        progress.activity("error", &message);
+                    }
+                    messages.push(message);
+                }
             }
         }
         let status = child.wait()?;
@@ -886,6 +1017,7 @@ fn perform_copy(job: &SyncJob, progress: Option<&ProgressReporter>) -> AppResult
             if let Some(progress) = progress {
                 let completed_percent = (((source_index + 1) * 100) / source_count.max(1)) as i64;
                 progress.report(completed_percent.min(99), &progress_message);
+                progress.activity("success", &format!("Finished backing up {source_name}."));
             }
             let message = if messages.is_empty() {
                 "Backup completed".into()
@@ -899,16 +1031,26 @@ fn perform_copy(job: &SyncJob, progress: Option<&ProgressReporter>) -> AppResult
             } else {
                 compact_output(messages.join("\n").as_bytes(), &[])
             };
-            failures.push(format!("{source_name}: {message}"));
+            let failure = format!("{source_name}: {message}");
+            if let Some(progress) = progress {
+                progress.activity("error", &failure);
+            }
+            failures.push(failure);
         }
     }
 
     if failures.is_empty() {
         if supports_previous_files(job) {
+            if let Some(progress) = progress {
+                progress.activity("preparing", "Checking the Previous files retention limit.");
+            }
             if let Err(error) = prune_version_history(job) {
-                completed.push(format!(
-                    "Backup completed, but old Previous files need attention: {error}"
-                ));
+                let warning =
+                    format!("Backup completed, but old Previous files need attention: {error}");
+                if let Some(progress) = progress {
+                    progress.activity("error", &warning);
+                }
+                completed.push(warning);
             }
         }
         Ok(CopyOutcome {
@@ -966,6 +1108,13 @@ async fn execute_job(job_id: i64, state: AppState) -> AppResult<RunRecord> {
                 "This backup is already running in the background".into(),
             ));
         }
+        connection.execute("DELETE FROM backup_activity WHERE job_id = ?1", [job_id])?;
+        record_activity(
+            &connection,
+            job_id,
+            "preparing",
+            "Backup started. Getting everything ready.",
+        )?;
         drop(connection);
 
         let job_for_copy = job.clone();
@@ -973,16 +1122,26 @@ async fn execute_job(job_id: i64, state: AppState) -> AppResult<RunRecord> {
             db_path: state.db_path.clone(),
             job_id,
         };
-        let copy_result =
-            tokio::task::spawn_blocking(move || perform_copy(&job_for_copy, Some(&progress)))
-                .await
-                .map_err(|error| AppError::Transfer(format!("Backup worker failed: {error}")))?;
+        let worker_progress = progress.clone();
+        let copy_result = tokio::task::spawn_blocking(move || {
+            perform_copy(&job_for_copy, Some(&worker_progress))
+        })
+        .await
+        .map_err(|error| AppError::Transfer(format!("Backup worker failed: {error}")))?;
 
         let finished_at = now_string();
         let (status, message, full_completed) = match copy_result {
             Ok(outcome) => ("success", outcome.message, outcome.full_completed),
             Err(error) => ("error", error.to_string(), false),
         };
+        progress.activity(
+            status,
+            if status == "success" {
+                "Backup finished successfully."
+            } else {
+                &message
+            },
+        );
         let connection = connect(&state.db_path)?;
         connection.execute(
             "UPDATE jobs
@@ -1200,6 +1359,39 @@ fn job_history(job_id: i64, state: State<'_, AppState>) -> AppResult<Vec<RunReco
         })?
         .collect::<Result<Vec<_>, _>>()?;
     Ok(runs)
+}
+
+fn query_job_activity(connection: &Connection, job_id: i64) -> AppResult<Vec<ActivityLogEntry>> {
+    let mut statement = connection.prepare(
+        "SELECT id, job_id, occurred_at, state, message
+         FROM (
+             SELECT id, job_id, occurred_at, state, message
+             FROM backup_activity
+             WHERE job_id = ?1
+             ORDER BY id DESC
+             LIMIT 500
+         )
+         ORDER BY id ASC",
+    )?;
+    let entries = statement
+        .query_map([job_id], |row| {
+            Ok(ActivityLogEntry {
+                id: row.get(0)?,
+                job_id: row.get(1)?,
+                occurred_at: row.get(2)?,
+                state: row.get(3)?,
+                message: row.get(4)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(entries)
+}
+
+#[tauri::command]
+fn job_activity(job_id: i64, state: State<'_, AppState>) -> AppResult<Vec<ActivityLogEntry>> {
+    let connection = connect(&state.db_path)?;
+    get_job(&connection, job_id)?;
+    query_job_activity(&connection, job_id)
 }
 
 fn query_error_logs(connection: &Connection) -> AppResult<Vec<ErrorLog>> {
@@ -2006,6 +2198,7 @@ pub fn run() {
             list_version_files,
             restore_version_file,
             job_history,
+            job_activity,
             list_error_logs,
             list_remotes,
             connect_google_drive,
@@ -2104,6 +2297,48 @@ mod tests {
             source_progress_message("Documents", 1, 1),
             "Copying Documents"
         );
+    }
+
+    #[test]
+    fn activity_lines_are_cleaned_and_classified() {
+        assert_eq!(
+            clean_rclone_log_line(
+                "2026/07/28 09:14:00 NOTICE: 1 MiB / 2 MiB, 50%, 1 MiB/s, ETA 1s"
+            ),
+            "1 MiB / 2 MiB, 50%, 1 MiB/s, ETA 1s"
+        );
+        assert_eq!(activity_state_for_line("Checking files", false), "scanning");
+        assert_eq!(activity_state_for_line("Retry 1/3", false), "retrying");
+        assert_eq!(
+            activity_state_for_line("rate limit waiting", false),
+            "waiting"
+        );
+        assert_eq!(activity_state_for_line("transfer failed", false), "error");
+        assert_eq!(activity_state_for_line("50%", true), "copying");
+    }
+
+    #[test]
+    fn activity_log_keeps_the_latest_five_hundred_entries() {
+        let connection = Connection::open_in_memory().expect("open activity database");
+        connection
+            .execute_batch(
+                "CREATE TABLE backup_activity (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    job_id INTEGER NOT NULL,
+                    occurred_at TEXT NOT NULL,
+                    state TEXT NOT NULL,
+                    message TEXT NOT NULL
+                );",
+            )
+            .expect("create activity table");
+        for index in 0..505 {
+            record_activity(&connection, 1, "info", &format!("Message {index}"))
+                .expect("record activity");
+        }
+        let entries = query_job_activity(&connection, 1).expect("query activity");
+        assert_eq!(entries.len(), 500);
+        assert_eq!(entries.first().expect("first entry").message, "Message 5");
+        assert_eq!(entries.last().expect("last entry").message, "Message 504");
     }
 
     #[test]
@@ -2682,6 +2917,17 @@ mod tests {
         assert!(columns.contains(&"progress_percent".to_string()));
         assert!(columns.contains(&"progress_message".to_string()));
         assert!(columns.contains(&"retention_count".to_string()));
+        let activity_table_exists = connection
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM sqlite_master
+                    WHERE type = 'table' AND name = 'backup_activity'
+                )",
+                [],
+                |row| row.get::<_, bool>(0),
+            )
+            .expect("check activity table migration");
+        assert!(activity_table_exists);
 
         drop(statement);
         drop(connection);

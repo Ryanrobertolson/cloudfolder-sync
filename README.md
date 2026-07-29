@@ -20,6 +20,8 @@ True mirroring is available as an explicitly destructive option with a warning.
 - Full, incremental, differential, and mirroring transfer modes
 - Manual **Back up now** action
 - Live percentage and progress bar while files are being copied
+- Live, copyable activity log with working, waiting, retry, and error messages
+- Possible-stall warning when a running backup is quiet for 60 seconds
 - Configurable cloud safety copies with in-app file recovery
 - Google Drive and other rclone remote discovery
 - Always-on scheduling through a systemd user service
@@ -116,6 +118,17 @@ report.
 
 To change an existing job, click its card, choose **Edit backup**, make the
 changes, and press **Save changes**. Its existing run history is kept.
+
+While a backup is running, choose **View activity** below its progress bar to
+see what it is doing. You can also open any backup card and choose **Activity
+log**. The window follows new messages automatically, and includes controls to
+pause scrolling, refresh, or copy the log for troubleshooting. CloudFolder
+keeps the newest 500 messages from the latest run, so they remain available
+after the app window or background service closes.
+
+If no new message arrives for 60 seconds during a run, CloudFolder displays a
+possible-stall warning. This does not necessarily mean the backup is stuck: a
+large folder scan, slow network, or cloud rate limit can be quiet temporarily.
 
 Backup types behave as follows:
 

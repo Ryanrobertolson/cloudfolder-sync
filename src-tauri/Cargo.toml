@@ -1,6 +1,6 @@
 [package]
 name = "cloudfolder-sync"
-version = "0.7.0"
+version = "0.8.0"
 description = "Safe scheduled cloud backups for Ubuntu"
 authors = ["CloudFolder contributors"]
 edition = "2021"

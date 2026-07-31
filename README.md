@@ -19,9 +19,11 @@ True mirroring is available as an explicitly destructive option with a warning.
 - Editable backup names, sources, destinations, and schedules
 - Full, incremental, differential, and mirroring transfer modes
 - Manual **Back up now** action
+- Safe **Cancel backup** control for foreground and background-service runs
 - Live percentage and progress bar while files are being copied
 - Live, copyable activity log with working, waiting, retry, and error messages
 - Possible-stall warning when a running backup is quiet for 60 seconds
+- Per-backup ignore rules with a faster coding-folder preset
 - Configurable cloud safety copies with in-app file recovery
 - Google Drive and other rclone remote discovery
 - Always-on scheduling through a systemd user service
@@ -126,9 +128,28 @@ pause scrolling, refresh, or copy the log for troubleshooting. CloudFolder
 keeps the newest 500 messages from the latest run, so they remain available
 after the app window or background service closes.
 
+Choose **Cancel backup** beside a running progress bar or inside the activity
+window to stop only the current run. CloudFolder asks for confirmation, stops
+the active cloud transfer, and leaves files already uploaded safely in place.
+The backup job remains enabled and runs again at its next scheduled time. A
+cancelled run appears in Recent activity and is not reported as an error.
+
 If no new message arrives for 60 seconds during a run, CloudFolder displays a
 possible-stall warning. This does not necessarily mean the backup is stuck: a
 large folder scan, slow network, or cloud rate limit can be quiet temporarily.
+
+## Faster coding backups
+
+Development folders can contain hundreds of thousands of generated files that
+are slow to upload one at a time. Open a backup, choose **Edit backup**, and
+turn on **Skip files that coding tools can rebuild**. This skips `target`,
+`node_modules`, and `.git` folders at the top level or anywhere below it while
+continuing to back up source code and personal files.
+
+Open **Add your own skip rule** to enter additional rclone-style patterns such
+as `**/folder-name/**`. Ignore rules are saved separately for each backup and
+take effect on its next run. In Mirroring mode, ignored cloud paths are left
+alone rather than deleted.
 
 Backup types behave as follows:
 

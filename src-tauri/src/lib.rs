@@ -1,8 +1,11 @@
+mod providers;
+
 use chrono::{Duration, SecondsFormat, Utc};
+use providers::RemoteInfo;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     io::{BufRead, BufReader},
     path::{Path, PathBuf},
     process::{Command, Stdio},
@@ -32,6 +35,8 @@ enum AppError {
     Validation(String),
     #[error("{0}")]
     Transfer(String),
+    #[error("{0}")]
+    Cancelled(String),
 }
 
 impl Serialize for AppError {
@@ -62,6 +67,7 @@ struct SyncJob {
     progress_percent: i64,
     progress_message: Option<String>,
     retention_count: i64,
+    exclude_patterns: Vec<String>,
     created_at: String,
 }
 
@@ -73,6 +79,8 @@ struct NewJob {
     interval_minutes: i64,
     backup_mode: String,
     retention_count: i64,
+    #[serde(default)]
+    exclude_patterns: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -223,6 +231,8 @@ fn initialize_database(path: &Path) -> AppResult<()> {
             progress_percent INTEGER NOT NULL DEFAULT 0,
             progress_message TEXT,
             retention_count  INTEGER NOT NULL DEFAULT 5,
+            exclude_patterns TEXT NOT NULL DEFAULT '[]',
+            cancel_requested INTEGER NOT NULL DEFAULT 0,
             created_at       TEXT NOT NULL
         );
 
@@ -276,6 +286,16 @@ fn initialize_database(path: &Path) -> AppResult<()> {
         "retention_count",
         "ALTER TABLE jobs ADD COLUMN retention_count INTEGER NOT NULL DEFAULT 5",
     )?;
+    ensure_job_column(
+        &connection,
+        "exclude_patterns",
+        "ALTER TABLE jobs ADD COLUMN exclude_patterns TEXT NOT NULL DEFAULT '[]'",
+    )?;
+    ensure_job_column(
+        &connection,
+        "cancel_requested",
+        "ALTER TABLE jobs ADD COLUMN cancel_requested INTEGER NOT NULL DEFAULT 0",
+    )?;
     Ok(())
 }
 
@@ -291,7 +311,7 @@ fn reset_interrupted_jobs(path: &Path) -> AppResult<()> {
     connection.execute(
         "UPDATE jobs
          SET status = 'ready', last_message = 'Previous run was interrupted',
-             progress_percent = 0, progress_message = NULL
+             progress_percent = 0, progress_message = NULL, cancel_requested = 0
          WHERE status = 'running'",
         [],
     )?;
@@ -333,6 +353,7 @@ fn ensure_job_column(connection: &Connection, column: &str, migration: &str) -> 
 
 fn map_job(row: &rusqlite::Row<'_>) -> rusqlite::Result<SyncJob> {
     let stored_source: String = row.get(2)?;
+    let stored_exclude_patterns: String = row.get(15)?;
     Ok(SyncJob {
         id: row.get(0)?,
         name: row.get(1)?,
@@ -349,7 +370,8 @@ fn map_job(row: &rusqlite::Row<'_>) -> rusqlite::Result<SyncJob> {
         progress_percent: row.get(12)?,
         progress_message: row.get(13)?,
         retention_count: row.get(14)?,
-        created_at: row.get(15)?,
+        exclude_patterns: decode_exclude_patterns(&stored_exclude_patterns),
+        created_at: row.get(16)?,
     })
 }
 
@@ -360,13 +382,25 @@ fn decode_source_paths(stored: &str) -> Vec<String> {
         .unwrap_or_else(|| vec![stored.to_owned()])
 }
 
+fn decode_exclude_patterns(stored: &str) -> Vec<String> {
+    serde_json::from_str::<Vec<String>>(stored).unwrap_or_default()
+}
+
+fn clean_exclude_patterns(patterns: &[String]) -> Vec<String> {
+    patterns
+        .iter()
+        .map(|pattern| pattern.trim().to_owned())
+        .filter(|pattern| !pattern.is_empty())
+        .collect()
+}
+
 fn get_job(connection: &Connection, job_id: i64) -> AppResult<SyncJob> {
     connection
         .query_row(
             "SELECT id, name, source_path, destination, interval_minutes,
                     backup_mode, last_full_at, enabled, last_run_at, next_run_at,
                     status, last_message, progress_percent, progress_message,
-                    retention_count, created_at
+                    retention_count, exclude_patterns, created_at
              FROM jobs WHERE id = ?1",
             [job_id],
             map_job,
@@ -396,6 +430,33 @@ fn validate_new_job(input: &NewJob) -> AppResult<()> {
         return Err(AppError::Validation(
             "Choose between 1 and 50 previous backups, or turn previous files off".into(),
         ));
+    }
+    if input.exclude_patterns.len() > 100 {
+        return Err(AppError::Validation(
+            "A backup can have up to 100 ignore rules".into(),
+        ));
+    }
+    let cleaned_patterns = clean_exclude_patterns(&input.exclude_patterns);
+    if cleaned_patterns.len() != input.exclude_patterns.len() {
+        return Err(AppError::Validation("Remove any empty ignore rules".into()));
+    }
+    let mut seen_patterns = HashSet::new();
+    for pattern in &cleaned_patterns {
+        if pattern.len() > 512 || pattern.contains(['\n', '\r', '\0']) {
+            return Err(AppError::Validation(
+                "Each ignore rule must be one line and no more than 512 characters".into(),
+            ));
+        }
+        if matches!(pattern.as_str(), "*" | "**" | "/**" | "/**/*") {
+            return Err(AppError::Validation(
+                "That ignore rule would skip the entire backup".into(),
+            ));
+        }
+        if !seen_patterns.insert(pattern.to_lowercase()) {
+            return Err(AppError::Validation(
+                "The same ignore rule was added more than once".into(),
+            ));
+        }
     }
     if input.source_paths.is_empty() {
         return Err(AppError::Validation(
@@ -463,7 +524,7 @@ fn list_jobs(state: State<'_, AppState>) -> AppResult<Vec<SyncJob>> {
         "SELECT id, name, source_path, destination, interval_minutes,
                 backup_mode, last_full_at, enabled, last_run_at, next_run_at,
                 status, last_message, progress_percent, progress_message,
-                retention_count, created_at
+                retention_count, exclude_patterns, created_at
          FROM jobs ORDER BY created_at DESC",
     )?;
     let jobs = statement
@@ -480,11 +541,15 @@ fn create_job(input: NewJob, state: State<'_, AppState>) -> AppResult<SyncJob> {
     let next_run = add_minutes(input.interval_minutes);
     let stored_sources = serde_json::to_string(&input.source_paths)
         .map_err(|error| AppError::Validation(format!("Could not save the sources: {error}")))?;
+    let stored_exclude_patterns = serde_json::to_string(&clean_exclude_patterns(
+        &input.exclude_patterns,
+    ))
+    .map_err(|error| AppError::Validation(format!("Could not save the ignore rules: {error}")))?;
     connection.execute(
         "INSERT INTO jobs
             (name, source_path, destination, interval_minutes, backup_mode,
-             retention_count, enabled, next_run_at, status, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1, ?7, 'ready', ?8)",
+             retention_count, exclude_patterns, enabled, next_run_at, status, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 1, ?8, 'ready', ?9)",
         params![
             input.name.trim(),
             stored_sources,
@@ -492,6 +557,7 @@ fn create_job(input: NewJob, state: State<'_, AppState>) -> AppResult<SyncJob> {
             input.interval_minutes,
             input.backup_mode,
             input.retention_count,
+            stored_exclude_patterns,
             next_run,
             created_at
         ],
@@ -503,6 +569,11 @@ fn update_job_record(connection: &Connection, job_id: i64, input: &NewJob) -> Ap
     let current = get_job(connection, job_id)?;
     let stored_sources = serde_json::to_string(&input.source_paths)
         .map_err(|error| AppError::Validation(format!("Could not save the sources: {error}")))?;
+    let cleaned_exclude_patterns = clean_exclude_patterns(&input.exclude_patterns);
+    let stored_exclude_patterns =
+        serde_json::to_string(&cleaned_exclude_patterns).map_err(|error| {
+            AppError::Validation(format!("Could not save the ignore rules: {error}"))
+        })?;
     let next_run = if current.enabled {
         Some(add_minutes(input.interval_minutes))
     } else {
@@ -510,7 +581,8 @@ fn update_job_record(connection: &Connection, job_id: i64, input: &NewJob) -> Ap
     };
     let baseline_still_valid = current.source_paths == input.source_paths
         && current.destination == input.destination
-        && current.backup_mode == input.backup_mode;
+        && current.backup_mode == input.backup_mode
+        && current.exclude_patterns == cleaned_exclude_patterns;
     let last_full_at = baseline_still_valid
         .then_some(current.last_full_at)
         .flatten();
@@ -518,9 +590,9 @@ fn update_job_record(connection: &Connection, job_id: i64, input: &NewJob) -> Ap
         "UPDATE jobs
          SET name = ?1, source_path = ?2, destination = ?3,
              interval_minutes = ?4, backup_mode = ?5, last_full_at = ?6,
-             retention_count = ?7, next_run_at = ?8, status = ?9,
+             retention_count = ?7, exclude_patterns = ?8, next_run_at = ?9, status = ?10,
              progress_percent = 0, progress_message = NULL
-         WHERE id = ?10",
+         WHERE id = ?11",
         params![
             input.name.trim(),
             stored_sources,
@@ -529,6 +601,7 @@ fn update_job_record(connection: &Connection, job_id: i64, input: &NewJob) -> Ap
             input.backup_mode,
             last_full_at,
             input.retention_count,
+            stored_exclude_patterns,
             next_run,
             if current.enabled { "ready" } else { "paused" },
             job_id
@@ -559,6 +632,11 @@ fn update_job(job_id: i64, input: NewJob, state: State<'_, AppState>) -> AppResu
 fn set_job_enabled(job_id: i64, enabled: bool, state: State<'_, AppState>) -> AppResult<SyncJob> {
     let connection = connect(&state.db_path)?;
     let job = get_job(&connection, job_id)?;
+    if job.status == "running" {
+        return Err(AppError::Validation(
+            "Cancel the active backup before changing its schedule".into(),
+        ));
+    }
     let next_run = if enabled {
         Some(add_minutes(job.interval_minutes))
     } else {
@@ -577,6 +655,30 @@ fn set_job_enabled(job_id: i64, enabled: bool, state: State<'_, AppState>) -> Ap
         ],
     )?;
     get_job(&connection, job_id)
+}
+
+fn request_job_cancellation(connection: &Connection, job_id: i64) -> AppResult<String> {
+    get_job(connection, job_id)?;
+    let message = "Cancel requested. Stopping the active cloud transfer safely…";
+    let changed = connection.execute(
+        "UPDATE jobs
+         SET cancel_requested = 1, progress_message = 'Stopping safely…'
+         WHERE id = ?1 AND status = 'running'",
+        [job_id],
+    )?;
+    if changed == 0 {
+        return Err(AppError::Validation(
+            "This backup is not currently running".into(),
+        ));
+    }
+    record_activity(connection, job_id, "waiting", message)?;
+    Ok(message.into())
+}
+
+#[tauri::command]
+fn cancel_job(job_id: i64, state: State<'_, AppState>) -> AppResult<String> {
+    let connection = connect(&state.db_path)?;
+    request_job_cancellation(&connection, job_id)
 }
 
 #[tauri::command]
@@ -804,6 +906,33 @@ impl ProgressReporter {
         };
         let _ = record_activity(&connection, self.job_id, state, message);
     }
+
+    fn cancellation_requested(&self) -> bool {
+        let Ok(connection) = connect(&self.db_path) else {
+            return false;
+        };
+        connection
+            .query_row(
+                "SELECT cancel_requested FROM jobs WHERE id = ?1",
+                [self.job_id],
+                |row| row.get::<_, bool>(0),
+            )
+            .unwrap_or(false)
+    }
+}
+
+fn cancelled_error() -> AppError {
+    AppError::Cancelled(
+        "Backup cancelled. Files already uploaded were left safely in the cloud.".into(),
+    )
+}
+
+fn check_cancellation(progress: Option<&ProgressReporter>) -> AppResult<()> {
+    if progress.is_some_and(ProgressReporter::cancellation_requested) {
+        Err(cancelled_error())
+    } else {
+        Ok(())
+    }
 }
 
 fn rclone_progress_percent(line: &str) -> Option<i64> {
@@ -864,6 +993,7 @@ fn source_progress_message(source_name: &str, source_number: usize, source_count
 }
 
 fn perform_copy(job: &SyncJob, progress: Option<&ProgressReporter>) -> AppResult<CopyOutcome> {
+    check_cancellation(progress)?;
     let multiple_sources = job.source_paths.len() > 1;
     let source_count = job.source_paths.len();
     let mut completed = Vec::new();
@@ -889,9 +1019,27 @@ fn perform_copy(job: &SyncJob, progress: Option<&ProgressReporter>) -> AppResult
             progress.activity("preparing", "Preparing the Previous files safety folder.");
         }
         ensure_version_history(job)?;
+        check_cancellation(progress)?;
+    }
+    if !job.exclude_patterns.is_empty() {
+        if let Some(progress) = progress {
+            progress.activity(
+                "preparing",
+                &format!(
+                    "Using {} ignore rule{} to skip files that do not need backing up.",
+                    job.exclude_patterns.len(),
+                    if job.exclude_patterns.len() == 1 {
+                        ""
+                    } else {
+                        "s"
+                    }
+                ),
+            );
+        }
     }
 
     for (source_index, source_path) in job.source_paths.iter().enumerate() {
+        check_cancellation(progress)?;
         let source = Path::new(source_path);
         let source_name = source
             .file_name()
@@ -940,6 +1088,9 @@ fn perform_copy(job: &SyncJob, progress: Option<&ProgressReporter>) -> AppResult
             .arg("--retries=3")
             .stdout(Stdio::null())
             .stderr(Stdio::piped());
+        for pattern in &job.exclude_patterns {
+            command.arg("--exclude").arg(pattern);
+        }
         if supports_previous_files(job) {
             let snapshot = version_snapshot_destination(job, &stamp)?;
             let backup_directory = if multiple_sources {
@@ -960,6 +1111,7 @@ fn perform_copy(job: &SyncJob, progress: Option<&ProgressReporter>) -> AppResult
                 }
             }
         }
+        check_cancellation(progress)?;
         let mut child = command.spawn().map_err(|error| {
             AppError::Transfer(format!(
                 "Could not start rclone: {error}. Install rclone and try again."
@@ -1011,6 +1163,19 @@ fn perform_copy(job: &SyncJob, progress: Option<&ProgressReporter>) -> AppResult
                     messages.push(message);
                 }
             }
+            if progress.is_some_and(ProgressReporter::cancellation_requested) {
+                if let Some(progress) = progress {
+                    progress.activity("cancelled", "Stopping the active cloud transfer safely.");
+                }
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(cancelled_error());
+            }
+        }
+        if progress.is_some_and(ProgressReporter::cancellation_requested) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(cancelled_error());
         }
         let status = child.wait()?;
         if status.success() {
@@ -1040,6 +1205,7 @@ fn perform_copy(job: &SyncJob, progress: Option<&ProgressReporter>) -> AppResult
     }
 
     if failures.is_empty() {
+        check_cancellation(progress)?;
         if supports_previous_files(job) {
             if let Some(progress) = progress {
                 progress.activity("preparing", "Checking the Previous files retention limit.");
@@ -1099,7 +1265,8 @@ async fn execute_job(job_id: i64, state: AppState) -> AppResult<RunRecord> {
         let claimed = connection.execute(
             "UPDATE jobs
              SET status = 'running', last_message = NULL,
-                 progress_percent = 0, progress_message = 'Getting ready…'
+                 progress_percent = 0, progress_message = 'Getting ready…',
+                 cancel_requested = 0
              WHERE id = ?1 AND status != 'running'",
             [job_id],
         )?;
@@ -1130,13 +1297,22 @@ async fn execute_job(job_id: i64, state: AppState) -> AppResult<RunRecord> {
         .map_err(|error| AppError::Transfer(format!("Backup worker failed: {error}")))?;
 
         let finished_at = now_string();
-        let (status, message, full_completed) = match copy_result {
-            Ok(outcome) => ("success", outcome.message, outcome.full_completed),
-            Err(error) => ("error", error.to_string(), false),
+        let (run_status, job_status, message, full_completed) = match copy_result {
+            Ok(_) if progress.cancellation_requested() => {
+                ("cancelled", "ready", cancelled_error().to_string(), false)
+            }
+            Ok(outcome) => (
+                "success",
+                "success",
+                outcome.message,
+                outcome.full_completed,
+            ),
+            Err(AppError::Cancelled(message)) => ("cancelled", "ready", message, false),
+            Err(error) => ("error", "error", error.to_string(), false),
         };
         progress.activity(
-            status,
-            if status == "success" {
+            run_status,
+            if run_status == "success" {
                 "Backup finished successfully."
             } else {
                 &message
@@ -1149,10 +1325,10 @@ async fn execute_job(job_id: i64, state: AppState) -> AppResult<RunRecord> {
                  next_run_at = ?4,
                  last_full_at = CASE WHEN ?5 = 1 THEN ?3 ELSE last_full_at END,
                  progress_percent = CASE WHEN ?1 = 'success' THEN 100 ELSE 0 END,
-                 progress_message = NULL
+                 progress_message = NULL, cancel_requested = 0
              WHERE id = ?6",
             params![
-                status,
+                job_status,
                 message,
                 finished_at,
                 add_minutes(job.interval_minutes),
@@ -1164,14 +1340,14 @@ async fn execute_job(job_id: i64, state: AppState) -> AppResult<RunRecord> {
             "INSERT INTO runs
                 (job_id, started_at, finished_at, status, message)
              VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![job_id, started_at, finished_at, status, message],
+            params![job_id, started_at, finished_at, run_status, message],
         )?;
         Ok(RunRecord {
             id: connection.last_insert_rowid(),
             job_id,
             started_at,
             finished_at,
-            status: status.into(),
+            status: run_status.into(),
             message,
         })
     }
@@ -1425,131 +1601,64 @@ fn list_error_logs(state: State<'_, AppState>) -> AppResult<Vec<ErrorLog>> {
     query_error_logs(&connection)
 }
 
-#[tauri::command]
 fn configured_remotes() -> AppResult<Vec<String>> {
-    let output = Command::new("rclone")
-        .arg("listremotes")
-        .output()
-        .map_err(|error| {
-            AppError::Transfer(format!(
-                "Could not run rclone: {error}. Install rclone and try again."
-            ))
-        })?;
-    if !output.status.success() {
-        return Err(AppError::Transfer(compact_output(
-            &output.stdout,
-            &output.stderr,
-        )));
-    }
-    Ok(String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .map(str::to_owned)
+    Ok(providers::remote_list()?
+        .into_iter()
+        .map(|remote| remote.name)
         .collect())
 }
 
 #[tauri::command]
-fn list_remotes() -> AppResult<Vec<String>> {
-    configured_remotes()
-}
-
-const GOOGLE_REMOTE_NAME: &str = "CloudFolder:";
-
-fn google_drive_config_args() -> [&'static str; 8] {
-    [
-        "config",
-        "create",
-        "CloudFolder",
-        "drive",
-        "scope",
-        "drive",
-        "config_is_local",
-        "true",
-    ]
-}
-
-fn google_drive_update_args() -> [&'static str; 8] {
-    [
-        "config",
-        "update",
-        "CloudFolder",
-        "scope",
-        "drive",
-        "config_is_local",
-        "true",
-        "--auto-confirm",
-    ]
-}
-
-fn cloudfolder_drive_has_browse_access() -> AppResult<bool> {
-    let output = Command::new("rclone")
-        .args(["config", "redacted", "CloudFolder"])
-        .output()?;
-    if !output.status.success() {
-        return Err(AppError::Transfer(compact_output(
-            &output.stdout,
-            &output.stderr,
-        )));
-    }
-    let config = String::from_utf8_lossy(&output.stdout);
-    let is_drive = config
-        .lines()
-        .any(|line| line.trim().eq_ignore_ascii_case("type = drive"));
-    if !is_drive {
-        return Err(AppError::Validation(
-            "A different cloud connection is already named CloudFolder. Rename it in advanced setup and try again."
-                .into(),
-        ));
-    }
-    Ok(config
-        .lines()
-        .any(|line| line.trim().eq_ignore_ascii_case("scope = drive")))
+fn list_remotes() -> AppResult<Vec<RemoteInfo>> {
+    providers::remote_list()
 }
 
 #[tauri::command]
-async fn connect_google_drive() -> AppResult<String> {
-    tauri::async_runtime::spawn_blocking(|| {
-        let already_exists = configured_remotes()?
-            .iter()
-            .any(|remote| remote == GOOGLE_REMOTE_NAME);
-        if already_exists && cloudfolder_drive_has_browse_access()? {
-            return Ok(GOOGLE_REMOTE_NAME.to_owned());
-        }
+fn list_providers() -> Vec<providers::ProviderInfo> {
+    providers::provider_infos()
+}
 
-        let mut command = Command::new("rclone");
-        if already_exists {
-            command.args(google_drive_update_args());
-        } else {
-            command.args(google_drive_config_args());
-        }
-        let output = command.output().map_err(|error| {
-            AppError::Transfer(format!(
-                "CloudFolder could not start Google sign-in: {error}"
-            ))
-        })?;
+/// Signs in to a browser-based provider. Blocking because rclone waits for the
+/// whole OAuth round trip, so it runs off the interface thread.
+#[tauri::command]
+async fn connect_provider(provider_id: String) -> AppResult<String> {
+    tauri::async_runtime::spawn_blocking(move || providers::connect_browser(&provider_id))
+        .await
+        .map_err(|error| AppError::Transfer(format!("Cloud sign-in stopped: {error}")))?
+}
 
-        if !output.status.success() {
-            let details = compact_output(&output.stdout, &output.stderr);
-            return Err(AppError::Transfer(format!(
-                "Google Drive did not finish connecting. {details}"
-            )));
-        }
+/// Creates a remote from credentials typed into a form.
+#[tauri::command]
+async fn connect_provider_with_fields(
+    provider_id: String,
+    fields: HashMap<String, String>,
+) -> AppResult<String> {
+    tauri::async_runtime::spawn_blocking(move || providers::connect_fields(&provider_id, fields))
+        .await
+        .map_err(|error| AppError::Transfer(format!("Cloud setup stopped: {error}")))?
+}
 
-        if configured_remotes()?
-            .iter()
-            .any(|remote| remote == GOOGLE_REMOTE_NAME)
-        {
-            Ok(GOOGLE_REMOTE_NAME.to_owned())
-        } else {
-            Err(AppError::Transfer(
-                "Google Drive sign-in finished, but the connection was not saved. Try again."
-                    .into(),
-            ))
-        }
-    })
-    .await
-    .map_err(|error| AppError::Transfer(format!("Google sign-in stopped: {error}")))?
+/// Forgets a cloud connection, refusing while any backup job still points at it.
+#[tauri::command]
+fn disconnect_remote(state: State<'_, AppState>, remote: String) -> AppResult<()> {
+    let connection = connect(&state.db_path)?;
+    let mut statement = connection.prepare("SELECT name, destination FROM jobs")?;
+    let users: Vec<String> = statement
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .filter(|(_, destination)| destination.starts_with(&remote))
+        .map(|(name, _)| name)
+        .collect();
+    if !users.is_empty() {
+        return Err(AppError::Validation(format!(
+            "These backups still use this cloud account: {}. Point them somewhere else first.",
+            users.join(", ")
+        )));
+    }
+    providers::delete_remote(&remote)
 }
 
 #[tauri::command]
@@ -1566,12 +1675,14 @@ fn list_cloud_folders(remote: String, path: String) -> AppResult<Vec<CloudFolder
         .output()
         .map_err(|error| {
             AppError::Transfer(format!(
-                "CloudFolder could not look inside Google Drive: {error}"
+                "CloudFolder could not look inside {}: {error}",
+                remote_label(&remote)
             ))
         })?;
     if !output.status.success() {
         return Err(AppError::Transfer(format!(
-            "Google Drive could not open this folder. {}",
+            "{} could not open this folder. {}",
+            remote_label(&remote),
             compact_output(&output.stdout, &output.stderr)
         )));
     }
@@ -1580,7 +1691,8 @@ fn list_cloud_folders(remote: String, path: String) -> AppResult<Vec<CloudFolder
         serde_json::from_slice::<Vec<RcloneListItem>>(&output.stdout)
             .map_err(|error| {
                 AppError::Transfer(format!(
-                    "Google Drive returned a folder list CloudFolder could not read: {error}"
+                    "{} returned a folder list CloudFolder could not read: {error}",
+                    remote_label(&remote)
                 ))
             })?
             .into_iter()
@@ -1622,16 +1734,33 @@ fn create_cloud_folder(remote: String, path: String, name: String) -> AppResult<
         .output()
         .map_err(|error| {
             AppError::Transfer(format!(
-                "CloudFolder could not create that Google Drive folder: {error}"
+                "CloudFolder could not create that folder in {}: {error}",
+                remote_label(&remote)
             ))
         })?;
     if !output.status.success() {
         return Err(AppError::Transfer(format!(
-            "Google Drive could not create that folder. {}",
+            "{} could not create that folder. {}",
+            remote_label(&remote),
             compact_output(&output.stdout, &output.stderr)
         )));
     }
     Ok(new_path)
+}
+
+/// The friendly name of a connected remote, for use in messages. Falls back to
+/// the remote's own name when it cannot be looked up, so a failing lookup never
+/// hides the error the user actually needs to read.
+fn remote_label(remote: &str) -> String {
+    providers::remote_list()
+        .ok()
+        .and_then(|remotes| {
+            remotes
+                .into_iter()
+                .find(|candidate| candidate.name == remote)
+                .map(|candidate| candidate.label)
+        })
+        .unwrap_or_else(|| remote.trim_end_matches(':').to_owned())
 }
 
 fn ensure_configured_remote(remote: &str) -> AppResult<()> {
@@ -1641,7 +1770,7 @@ fn ensure_configured_remote(remote: &str) -> AppResult<()> {
             .any(|configured| configured == remote)
     {
         return Err(AppError::Validation(
-            "Choose a connected Google Drive account first".into(),
+            "Choose a connected cloud account first".into(),
         ));
     }
     Ok(())
@@ -1651,12 +1780,12 @@ fn clean_cloud_path(path: &str) -> AppResult<String> {
     let clean = path.trim_matches('/').trim().to_owned();
     if clean.split('/').any(|part| part == "." || part == "..") {
         return Err(AppError::Validation(
-            "That Google Drive folder path is not valid".into(),
+            "That cloud folder path is not valid".into(),
         ));
     }
     if clean.chars().any(char::is_control) {
         return Err(AppError::Validation(
-            "That Google Drive folder path contains unsupported characters".into(),
+            "That cloud folder path contains unsupported characters".into(),
         ));
     }
     Ok(clean)
@@ -2192,6 +2321,7 @@ pub fn run() {
             create_job,
             update_job,
             set_job_enabled,
+            cancel_job,
             delete_job,
             run_job,
             list_version_snapshots,
@@ -2201,7 +2331,10 @@ pub fn run() {
             job_activity,
             list_error_logs,
             list_remotes,
-            connect_google_drive,
+            list_providers,
+            connect_provider,
+            connect_provider_with_fields,
+            disconnect_remote,
             list_cloud_folders,
             create_cloud_folder,
             open_rclone_config,
@@ -2231,6 +2364,7 @@ mod tests {
             interval_minutes: 60,
             backup_mode: "incremental".into(),
             retention_count: 5,
+            exclude_patterns: Vec::new(),
         };
         assert!(validate_new_job(&input).is_err());
     }
@@ -2244,6 +2378,7 @@ mod tests {
             interval_minutes: 60,
             backup_mode: "incremental".into(),
             retention_count: 5,
+            exclude_patterns: Vec::new(),
         };
         assert!(validate_new_job(&input).is_err());
     }
@@ -2260,6 +2395,7 @@ mod tests {
             interval_minutes: 60,
             backup_mode: "mirror".into(),
             retention_count: 5,
+            exclude_patterns: Vec::new(),
         };
         assert!(validate_new_job(&input).is_err());
         std::fs::remove_file(file_path).expect("clean up mirror file fixture");
@@ -2342,6 +2478,64 @@ mod tests {
     }
 
     #[test]
+    fn cancel_request_is_seen_by_the_backup_worker() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock should be after the Unix epoch")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "cloudfolder-cancel-test-{}-{unique}",
+            std::process::id()
+        ));
+        let source = root.join("source");
+        let destination = root.join("destination");
+        std::fs::create_dir_all(&source).expect("create cancellation source");
+        std::fs::create_dir_all(&destination).expect("create cancellation destination");
+        std::fs::write(source.join("should-not-copy.txt"), "cancel me")
+            .expect("write cancellation fixture");
+        let database_path = root.join("cloudfolder.sqlite3");
+        initialize_database(&database_path).expect("initialize cancellation database");
+        let connection = connect(&database_path).expect("open cancellation database");
+        connection
+            .execute(
+                "INSERT INTO jobs
+                    (id, name, source_path, destination, interval_minutes,
+                     enabled, status, created_at)
+                 VALUES (1, 'Cancelled backup', ?1, ?2, 60, 1, 'running', ?3)",
+                params![
+                    serde_json::to_string(&vec![source.to_string_lossy().into_owned()])
+                        .expect("encode cancellation source"),
+                    format!(":local:{}", destination.display()),
+                    now_string()
+                ],
+            )
+            .expect("insert running cancellation job");
+
+        let message = request_job_cancellation(&connection, 1).expect("request cancellation");
+        assert!(message.contains("Stopping"));
+        let requested = connection
+            .query_row(
+                "SELECT cancel_requested FROM jobs WHERE id = 1",
+                [],
+                |row| row.get::<_, bool>(0),
+            )
+            .expect("read cancellation request");
+        assert!(requested);
+        let job = get_job(&connection, 1).expect("read cancellation job");
+        drop(connection);
+
+        let reporter = ProgressReporter {
+            db_path: database_path,
+            job_id: 1,
+        };
+        let result = perform_copy(&job, Some(&reporter));
+        assert!(matches!(result, Err(AppError::Cancelled(_))));
+        assert!(!destination.join("should-not-copy.txt").exists());
+
+        std::fs::remove_dir_all(root).expect("clean up cancellation test");
+    }
+
+    #[test]
     fn retention_limits_are_validated() {
         let mut input = NewJob {
             name: "Documents".into(),
@@ -2350,11 +2544,19 @@ mod tests {
             interval_minutes: 60,
             backup_mode: "incremental".into(),
             retention_count: 5,
+            exclude_patterns: Vec::new(),
         };
         assert!(validate_new_job(&input).is_ok());
         input.retention_count = 0;
         assert!(validate_new_job(&input).is_ok());
         input.retention_count = 51;
+        assert!(validate_new_job(&input).is_err());
+        input.retention_count = 5;
+        input.exclude_patterns = vec!["**/target/**".into(), "**/.git/**".into()];
+        assert!(validate_new_job(&input).is_ok());
+        input.exclude_patterns = vec!["**".into()];
+        assert!(validate_new_job(&input).is_err());
+        input.exclude_patterns = vec!["**/target/**".into(), "**/TARGET/**".into()];
         assert!(validate_new_job(&input).is_err());
     }
 
@@ -2376,6 +2578,7 @@ mod tests {
             progress_percent: 0,
             progress_message: None,
             retention_count: 5,
+            exclude_patterns: Vec::new(),
             created_at: now_string(),
         };
         assert_eq!(
@@ -2437,6 +2640,7 @@ mod tests {
             progress_percent: 0,
             progress_message: None,
             retention_count: 2,
+            exclude_patterns: Vec::new(),
             created_at: now_string(),
         };
         let history_root = version_history_root(&job)
@@ -2550,6 +2754,7 @@ mod tests {
             interval_minutes: 180,
             backup_mode: "incremental".into(),
             retention_count: 7,
+            exclude_patterns: vec!["target/**".into(), "**/target/**".into()],
         };
         let updated =
             update_job_record(&connection, 1, &input).expect("update existing backup job");
@@ -2563,6 +2768,7 @@ mod tests {
         assert_eq!(updated.destination, "CloudFolder:New");
         assert_eq!(updated.interval_minutes, 180);
         assert_eq!(updated.retention_count, 7);
+        assert_eq!(updated.exclude_patterns, input.exclude_patterns);
         assert_eq!(run_count, 1);
 
         drop(connection);
@@ -2583,11 +2789,20 @@ mod tests {
 
     #[test]
     fn google_setup_requests_folder_browsing_access() {
-        let arguments = google_drive_config_args();
-        assert_eq!(arguments[2], "CloudFolder");
-        assert_eq!(arguments[3], "drive");
-        assert_eq!(arguments[5], "drive");
-        assert_eq!(arguments[7], "true");
+        let drive = providers::catalog()
+            .iter()
+            .find(|provider| provider.id == "google_drive")
+            .expect("Google Drive should stay in the catalog");
+        assert_eq!(drive.backend, "drive");
+        assert_eq!(providers::remote_name_for(drive, &[]), "CloudFolder");
+        assert!(drive
+            .stored_options
+            .iter()
+            .any(|(key, value)| *key == "scope" && *value == "drive"));
+        assert!(drive
+            .config_answers
+            .iter()
+            .any(|(key, value)| *key == "config_is_local" && *value == "true"));
     }
 
     #[test]
@@ -2625,6 +2840,31 @@ mod tests {
         std::fs::create_dir_all(&destination_dir).expect("create test destination");
         std::fs::write(source_dir.join("new.txt"), "new backup content")
             .expect("write source fixture");
+        std::fs::create_dir_all(source_dir.join("project/target/debug"))
+            .expect("create ignored build folder");
+        std::fs::create_dir_all(source_dir.join("target/debug"))
+            .expect("create ignored top-level build folder");
+        std::fs::create_dir_all(source_dir.join("web/node_modules/package"))
+            .expect("create ignored dependency folder");
+        std::fs::create_dir_all(source_dir.join(".git/objects"))
+            .expect("create ignored git folder");
+        std::fs::write(
+            source_dir.join("project/target/debug/generated.o"),
+            "rebuildable artifact",
+        )
+        .expect("write ignored build artifact");
+        std::fs::write(
+            source_dir.join("target/debug/top-level.o"),
+            "rebuildable top-level artifact",
+        )
+        .expect("write ignored top-level build artifact");
+        std::fs::write(
+            source_dir.join("web/node_modules/package/index.js"),
+            "installed dependency",
+        )
+        .expect("write ignored dependency artifact");
+        std::fs::write(source_dir.join(".git/objects/object"), "git object")
+            .expect("write ignored git artifact");
         std::fs::write(destination_dir.join("existing.txt"), "must remain")
             .expect("write destination fixture");
 
@@ -2644,6 +2884,14 @@ mod tests {
             progress_percent: 0,
             progress_message: None,
             retention_count: 2,
+            exclude_patterns: vec![
+                "target/**".into(),
+                "**/target/**".into(),
+                "node_modules/**".into(),
+                "**/node_modules/**".into(),
+                ".git/**".into(),
+                "**/.git/**".into(),
+            ],
             created_at: now_string(),
         };
 
@@ -2659,6 +2907,14 @@ mod tests {
                 .expect("read pre-existing file"),
             "must remain"
         );
+        assert!(!destination_dir
+            .join("project/target/debug/generated.o")
+            .exists());
+        assert!(!destination_dir.join("target/debug/top-level.o").exists());
+        assert!(!destination_dir
+            .join("web/node_modules/package/index.js")
+            .exists());
+        assert!(!destination_dir.join(".git/objects/object").exists());
         std::fs::write(source_dir.join("new.txt"), "updated backup content")
             .expect("update source fixture");
         perform_copy(&job, None).expect("perform update with safety copy");
@@ -2733,6 +2989,7 @@ mod tests {
             progress_percent: 0,
             progress_message: None,
             retention_count: 0,
+            exclude_patterns: Vec::new(),
             created_at: now_string(),
         };
 
@@ -2783,6 +3040,7 @@ mod tests {
             progress_percent: 0,
             progress_message: None,
             retention_count: 0,
+            exclude_patterns: Vec::new(),
             created_at: now_string(),
         };
 
@@ -2812,8 +3070,12 @@ mod tests {
         let destination = root.join("destination");
         std::fs::create_dir_all(&source).expect("create mirror source");
         std::fs::create_dir_all(&destination).expect("create mirror destination");
+        std::fs::create_dir_all(destination.join(".git/objects"))
+            .expect("create excluded mirror destination");
         std::fs::write(source.join("keep.txt"), "keep").expect("write mirror source");
         std::fs::write(destination.join("remove.txt"), "remove").expect("write extra mirror file");
+        std::fs::write(destination.join(".git/objects/keep"), "ignored cloud file")
+            .expect("write excluded mirror file");
         let job = SyncJob {
             id: 4,
             name: "Mirror".into(),
@@ -2830,6 +3092,7 @@ mod tests {
             progress_percent: 0,
             progress_message: None,
             retention_count: 2,
+            exclude_patterns: vec![".git/**".into(), "**/.git/**".into()],
             created_at: now_string(),
         };
 
@@ -2841,6 +3104,7 @@ mod tests {
         perform_copy(&job, None).expect("perform mirror");
         assert!(destination.join("keep.txt").exists());
         assert!(!destination.join("remove.txt").exists());
+        assert!(destination.join(".git/objects/keep").exists());
         let snapshots = std::fs::read_dir(history_root)
             .expect("read mirror safety copies")
             .collect::<Result<Vec<_>, _>>()
@@ -2917,6 +3181,8 @@ mod tests {
         assert!(columns.contains(&"progress_percent".to_string()));
         assert!(columns.contains(&"progress_message".to_string()));
         assert!(columns.contains(&"retention_count".to_string()));
+        assert!(columns.contains(&"exclude_patterns".to_string()));
+        assert!(columns.contains(&"cancel_requested".to_string()));
         let activity_table_exists = connection
             .query_row(
                 "SELECT EXISTS(
@@ -2965,6 +3231,7 @@ mod tests {
             progress_percent: 0,
             progress_message: None,
             retention_count: 0,
+            exclude_patterns: Vec::new(),
             created_at: now_string(),
         };
 

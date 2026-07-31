@@ -5,11 +5,44 @@ import { open } from "@tauri-apps/plugin-dialog";
 type JobStatus = "ready" | "running" | "success" | "error" | "paused";
 type BackupMode = "full" | "incremental" | "differential" | "mirror";
 type CloudSetupStatus =
+  | "picker"
   | "ready"
+  | "form"
   | "connecting"
   | "success"
   | "error"
   | "advanced";
+
+interface RemoteInfo {
+  name: string;
+  backend: string;
+  label: string;
+}
+
+interface ProviderChoice {
+  value: string;
+  label: string;
+  prefill: [string, string][];
+}
+
+interface ProviderField {
+  key: string;
+  label: string;
+  help: string;
+  required: boolean;
+  secret: boolean;
+  default: string;
+  choices: ProviderChoice[];
+}
+
+interface CloudProvider {
+  id: string;
+  label: string;
+  backend: string;
+  auth: "browser" | "fields";
+  blurb: string;
+  fields: ProviderField[];
+}
 
 interface SyncJob {
   id: number;
@@ -27,6 +60,7 @@ interface SyncJob {
   progress_percent: number;
   progress_message: string | null;
   retention_count: number;
+  exclude_patterns: string[];
   created_at: string;
 }
 
@@ -54,6 +88,7 @@ type ActivityState =
   | "copying"
   | "retrying"
   | "waiting"
+  | "cancelled"
   | "success"
   | "error"
   | "info";
@@ -127,7 +162,17 @@ interface JobDraft {
   interval_minutes: number;
   backup_mode: BackupMode;
   retention_count: number;
+  exclude_patterns: string[];
 }
+
+const developerExcludePatterns: string[] = [
+  "target/**",
+  "**/target/**",
+  "node_modules/**",
+  "**/node_modules/**",
+  ".git/**",
+  "**/.git/**",
+];
 
 interface CloudFolderEntry {
   name: string;
@@ -142,6 +187,7 @@ const initialDraft: JobDraft = {
   interval_minutes: 60,
   backup_mode: "incremental",
   retention_count: 5,
+  exclude_patterns: [],
 };
 
 function formatTime(value: string | null): string {
@@ -210,6 +256,7 @@ function activityStateLabel(state: ActivityState): string {
   if (state === "copying") return "Copying";
   if (state === "retrying") return "Retrying";
   if (state === "waiting") return "Waiting";
+  if (state === "cancelled") return "Cancelled";
   if (state === "success") return "Finished";
   if (state === "error") return "Problem";
   return "Info";
@@ -217,17 +264,23 @@ function activityStateLabel(state: ActivityState): string {
 
 export default function App() {
   const [jobs, setJobs] = useState<SyncJob[]>([]);
-  const [remotes, setRemotes] = useState<string[]>([]);
+  const [remotes, setRemotes] = useState<RemoteInfo[]>([]);
+  const [providers, setProviders] = useState<CloudProvider[]>([]);
   const [draft, setDraft] = useState<JobDraft>(initialDraft);
   const [showCreate, setShowCreate] = useState(false);
   const [editingJob, setEditingJob] = useState<SyncJob | null>(null);
   const [showCloudSetup, setShowCloudSetup] = useState(false);
   const [cloudSetupStatus, setCloudSetupStatus] =
-    useState<CloudSetupStatus>("ready");
+    useState<CloudSetupStatus>("picker");
   const [cloudSetupMessage, setCloudSetupMessage] = useState<string | null>(null);
+  const [activeProvider, setActiveProvider] = useState<CloudProvider | null>(
+    null,
+  );
+  const [fieldValues, setFieldValues] = useState<Record<string, string>>({});
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [runningIds, setRunningIds] = useState<Set<number>>(new Set());
+  const [cancellingIds, setCancellingIds] = useState<Set<number>>(new Set());
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [selectedJob, setSelectedJob] = useState<SyncJob | null>(null);
@@ -277,25 +330,33 @@ export default function App() {
   const [showNewFolder, setShowNewFolder] = useState(false);
   const [newFolderName, setNewFolderName] = useState("");
   const [creatingFolder, setCreatingFolder] = useState(false);
+  const [ignorePatternInput, setIgnorePatternInput] = useState("");
 
   const refresh = useCallback(async () => {
     try {
-      const [nextJobs, nextRemotes, nextErrorLogs, nextServiceStatus] =
-        await Promise.all([
+      const [
+        nextJobs,
+        nextRemotes,
+        nextProviders,
+        nextErrorLogs,
+        nextServiceStatus,
+      ] = await Promise.all([
         invoke<SyncJob[]>("list_jobs"),
-        invoke<string[]>("list_remotes"),
+        invoke<RemoteInfo[]>("list_remotes"),
+        invoke<CloudProvider[]>("list_providers"),
         invoke<ErrorLog[]>("list_error_logs"),
-          invoke<BackgroundServiceStatus>("background_service_status"),
-        ]);
+        invoke<BackgroundServiceStatus>("background_service_status"),
+      ]);
       const safeJobs = nextJobs ?? [];
       const safeRemotes = nextRemotes ?? [];
       setJobs(safeJobs);
       setRemotes(safeRemotes);
+      setProviders(nextProviders ?? []);
       setErrorLogs(nextErrorLogs ?? []);
       if (nextServiceStatus) setServiceStatus(nextServiceStatus);
       setDraft((current) => ({
         ...current,
-        remote: current.remote || safeRemotes[0] || "",
+        remote: current.remote || safeRemotes[0]?.name || "",
       }));
       setError(null);
     } catch (reason) {
@@ -347,6 +408,9 @@ export default function App() {
   );
   const hasRunningJob =
     runningIds.size > 0 || jobs.some((job) => job.status === "running");
+  const developerExcludesEnabled = developerExcludePatterns.every((pattern) =>
+    draft.exclude_patterns.includes(pattern),
+  );
   const currentActivityJob = activityJob
     ? (jobs.find((job) => job.id === activityJob.id) ?? activityJob)
     : null;
@@ -354,6 +418,9 @@ export default function App() {
     currentActivityJob &&
       (currentActivityJob.status === "running" ||
         runningIds.has(currentActivityJob.id)),
+  );
+  const activityIsCancelling = Boolean(
+    currentActivityJob && cancellingIds.has(currentActivityJob.id),
   );
   const lastActivity = activityEntries.at(-1) ?? null;
   const secondsSinceActivity = lastActivity
@@ -365,7 +432,10 @@ export default function App() {
       )
     : 0;
   const activityMayBeStalled = Boolean(
-    activityIsRunning && lastActivity && secondsSinceActivity >= 60,
+    activityIsRunning &&
+      !activityIsCancelling &&
+      lastActivity &&
+      secondsSinceActivity >= 60,
   );
 
   useEffect(() => {
@@ -375,6 +445,19 @@ export default function App() {
     );
     return () => window.clearInterval(timer);
   }, [hasRunningJob, refreshJobs]);
+
+  useEffect(() => {
+    setCancellingIds((current) => {
+      const next = new Set(
+        [...current].filter((jobId) =>
+          jobs.some((job) => job.id === jobId && job.status === "running"),
+        ),
+      );
+      return next.size === current.size && [...next].every((id) => current.has(id))
+        ? current
+        : next;
+    });
+  }, [jobs]);
 
   useEffect(() => {
     if (!activityJob) return;
@@ -417,6 +500,41 @@ export default function App() {
     setDraft((current) => ({
       ...current,
       source_paths: current.source_paths.filter((source) => source !== path),
+    }));
+  }
+
+  function toggleDeveloperExcludes(enabled: boolean) {
+    setDraft((current) => ({
+      ...current,
+      exclude_patterns: enabled
+        ? Array.from(
+            new Set([
+              ...current.exclude_patterns,
+              ...developerExcludePatterns,
+            ]),
+          )
+        : current.exclude_patterns.filter(
+            (pattern) => !developerExcludePatterns.includes(pattern),
+          ),
+    }));
+  }
+
+  function addIgnorePattern() {
+    const pattern = ignorePatternInput.trim();
+    if (!pattern || draft.exclude_patterns.includes(pattern)) return;
+    setDraft((current) => ({
+      ...current,
+      exclude_patterns: [...current.exclude_patterns, pattern],
+    }));
+    setIgnorePatternInput("");
+  }
+
+  function removeIgnorePattern(pattern: string) {
+    setDraft((current) => ({
+      ...current,
+      exclude_patterns: current.exclude_patterns.filter(
+        (existing) => existing !== pattern,
+      ),
     }));
   }
 
@@ -467,19 +585,20 @@ export default function App() {
 
   function openNewJob() {
     setEditingJob(null);
-    setDraft({ ...initialDraft, remote: remotes[0] || "" });
+    setDraft({ ...initialDraft, remote: remotes[0]?.name || "" });
     setScheduleEditor(initialDraft.interval_minutes);
     setMirrorAcknowledged(false);
+    setIgnorePatternInput("");
     setShowCreate(true);
   }
 
   function openEditJob(job: SyncJob) {
     const matchingRemote = remotes.find((remote) =>
-      job.destination.startsWith(remote),
+      job.destination.startsWith(remote.name),
     );
     const colonIndex = job.destination.indexOf(":");
     const remote =
-      matchingRemote ||
+      matchingRemote?.name ||
       (colonIndex >= 0 ? job.destination.slice(0, colonIndex + 1) : "");
     setEditingJob(job);
     setDraft({
@@ -490,9 +609,11 @@ export default function App() {
       interval_minutes: job.interval_minutes,
       backup_mode: job.backup_mode,
       retention_count: job.retention_count,
+      exclude_patterns: [...(job.exclude_patterns ?? [])],
     });
     setScheduleEditor(job.interval_minutes);
     setMirrorAcknowledged(job.backup_mode === "mirror");
+    setIgnorePatternInput("");
     setSelectedJob(null);
     setShowCreate(true);
   }
@@ -515,6 +636,7 @@ export default function App() {
         interval_minutes: Number(draft.interval_minutes),
         backup_mode: draft.backup_mode,
         retention_count: Number(draft.retention_count),
+        exclude_patterns: draft.exclude_patterns,
       };
       await invoke<SyncJob>(editingJob ? "update_job" : "create_job", {
         ...(editingJob ? { jobId: editingJob.id } : {}),
@@ -523,11 +645,12 @@ export default function App() {
       const successMessage = editingJob
         ? `${draft.name.trim()} was updated.`
         : "Backup job created. It will run on its schedule.";
-      setDraft({ ...initialDraft, remote: remotes[0] || "" });
+      setDraft({ ...initialDraft, remote: remotes[0]?.name || "" });
       setShowAdvancedSchedule(false);
       setCustomInterval(1);
       setCustomIntervalUnit("hours");
       setMirrorAcknowledged(false);
+      setIgnorePatternInput("");
       setShowCreate(false);
       setEditingJob(null);
       setNotice(successMessage);
@@ -541,7 +664,7 @@ export default function App() {
 
   async function loadCloudFolders(path: string) {
     if (!draft.remote) {
-      setFolderError("Connect Google Drive first.");
+      setFolderError("Connect a cloud account first.");
       return;
     }
     setFolderLoading(true);
@@ -604,7 +727,9 @@ export default function App() {
       setNotice(
         result.status === "success"
           ? `${job.name} is safely backed up.`
-          : `${job.name} finished with an error.`,
+          : result.status === "cancelled"
+            ? `${job.name} was cancelled. Files already uploaded are still safe.`
+            : `${job.name} finished with an error.`,
       );
       await refresh();
       if (selectedJob?.id === job.id) await showHistory(job);
@@ -617,6 +742,30 @@ export default function App() {
         next.delete(job.id);
         return next;
       });
+    }
+  }
+
+  async function cancelJob(job: SyncJob) {
+    const confirmed = window.confirm(
+      `Stop “${job.name}” now? Files already uploaded will stay safely in the cloud, and the next scheduled backup will still run.`,
+    );
+    if (!confirmed) return;
+    setCancellingIds((current) => new Set(current).add(job.id));
+    setError(null);
+    try {
+      const message = await invoke<string>("cancel_job", { jobId: job.id });
+      setNotice(message);
+      await Promise.all([
+        refreshJobs(),
+        activityJob?.id === job.id ? refreshActivity(job.id) : Promise.resolve(),
+      ]);
+    } catch (reason) {
+      setCancellingIds((current) => {
+        const next = new Set(current);
+        next.delete(job.id);
+        return next;
+      });
+      setError(String(reason));
     }
   }
 
@@ -864,22 +1013,81 @@ export default function App() {
   }
 
   function configureCloud() {
-    const alreadyConnected = remotes.includes("CloudFolder:");
-    setCloudSetupStatus(alreadyConnected ? "success" : "ready");
+    setActiveProvider(null);
+    setFieldValues({});
+    setCloudSetupStatus("picker");
     setCloudSetupMessage(null);
     setShowCloudSetup(true);
   }
 
-  async function connectGoogleDrive() {
+  function startProvider(provider: CloudProvider) {
+    setActiveProvider(provider);
+    setCloudSetupMessage(null);
+    if (provider.auth === "browser") {
+      void connectBrowserProvider(provider);
+    } else {
+      const seeded: Record<string, string> = {};
+      for (const field of provider.fields) {
+        seeded[field.key] = field.default;
+      }
+      setFieldValues(seeded);
+      setCloudSetupStatus("form");
+    }
+  }
+
+  async function connectBrowserProvider(provider: CloudProvider) {
     setCloudSetupStatus("connecting");
     setCloudSetupMessage(null);
     setError(null);
     try {
-      await invoke<string>("connect_google_drive");
+      await invoke<string>("connect_provider", { providerId: provider.id });
       await refresh();
       setCloudSetupStatus("success");
     } catch (reason) {
       setCloudSetupStatus("error");
+      setCloudSetupMessage(String(reason));
+    }
+  }
+
+  async function submitProviderFields(event: React.FormEvent) {
+    event.preventDefault();
+    if (!activeProvider) return;
+    setCloudSetupStatus("connecting");
+    setCloudSetupMessage(null);
+    setError(null);
+    try {
+      await invoke<string>("connect_provider_with_fields", {
+        providerId: activeProvider.id,
+        fields: fieldValues,
+      });
+      await refresh();
+      setCloudSetupStatus("success");
+    } catch (reason) {
+      setCloudSetupStatus("error");
+      setCloudSetupMessage(String(reason));
+    }
+  }
+
+  function updateField(field: ProviderField, value: string) {
+    setFieldValues((current) => {
+      const next = { ...current, [field.key]: value };
+      const chosen = field.choices.find((choice) => choice.value === value);
+      if (chosen) {
+        for (const [key, prefill] of chosen.prefill) {
+          next[key] = prefill;
+        }
+      }
+      return next;
+    });
+  }
+
+  async function disconnectRemote(remote: RemoteInfo) {
+    setError(null);
+    try {
+      await invoke("disconnect_remote", { remote: remote.name });
+      await refresh();
+      setCloudSetupMessage(`${remote.label} was disconnected.`);
+    } catch (reason) {
       setCloudSetupMessage(String(reason));
     }
   }
@@ -923,7 +1131,8 @@ export default function App() {
             <b>{jobs.length}</b>
           </button>
           <button className="nav-item" onClick={() => configureCloud()}>
-            <span>☁</span> Google Drive
+            <span>☁</span> Cloud accounts
+            {remotes.length > 0 && <b>{remotes.length}</b>}
           </button>
           <button className="nav-item" onClick={() => void openErrorLog()}>
             <span>!</span> Error log
@@ -1042,14 +1251,14 @@ export default function App() {
             <div className="cloud-illustration">☁</div>
             <div>
               <p className="eyebrow">One-time setup</p>
-              <h2>Connect Google Drive</h2>
+              <h2>Connect a cloud account</h2>
               <p>
-                Press one button, choose your Google account, and you are done.
-                CloudFolder never sees your Google password.
+                Pick your cloud service and sign in. CloudFolder never sees your
+                password, and it never deletes files in the cloud.
               </p>
             </div>
             <button className="primary" onClick={() => configureCloud()}>
-              Add Google Drive
+              Add a cloud account
             </button>
           </section>
         )}
@@ -1126,6 +1335,7 @@ export default function App() {
                         <input
                           type="checkbox"
                           checked={job.enabled}
+                          disabled={isRunning}
                           onChange={(event) =>
                             void setEnabled(job, event.target.checked)
                           }
@@ -1155,12 +1365,23 @@ export default function App() {
                               />
                             </div>
                           </div>
-                          <button
-                            className="activity-link"
-                            onClick={() => void openActivityLog(job)}
-                          >
-                            View activity
-                          </button>
+                          <div className="running-job-links">
+                            <button
+                              className="activity-link"
+                              onClick={() => void openActivityLog(job)}
+                            >
+                              View activity
+                            </button>
+                            <button
+                              className="cancel-sync-link"
+                              disabled={cancellingIds.has(job.id)}
+                              onClick={() => void cancelJob(job)}
+                            >
+                              {cancellingIds.has(job.id)
+                                ? "Stopping…"
+                                : "Cancel backup"}
+                            </button>
+                          </div>
                         </div>
                       ) : (
                         <button
@@ -1207,15 +1428,26 @@ export default function App() {
               <div className="cloud-success">
                 <div className="big-success" aria-hidden="true">✓</div>
                 <p className="eyebrow">All done</p>
-                <h2 id="cloud-setup-title">Google Drive is ready!</h2>
+                <h2 id="cloud-setup-title">
+                  {activeProvider
+                    ? `${activeProvider.label} is ready!`
+                    : "Your cloud account is ready!"}
+                </h2>
                 <p>
-                  CloudFolder can now put your backup files safely in Google Drive.
+                  CloudFolder can now put your backup files safely in
+                  {activeProvider ? ` ${activeProvider.label}` : " the cloud"}.
                 </p>
                 <button
                   className="primary giant-button"
                   onClick={() => setShowCloudSetup(false)}
                 >
                   Great, let’s make a backup
+                </button>
+                <button
+                  className="advanced-link"
+                  onClick={() => setCloudSetupStatus("picker")}
+                >
+                  Add another cloud account
                 </button>
               </div>
             ) : cloudSetupStatus === "connecting" ? (
@@ -1224,11 +1456,23 @@ export default function App() {
                   <span>☁</span>
                 </div>
                 <p className="eyebrow">Almost there</p>
-                <h2 id="cloud-setup-title">Look at your web browser</h2>
-                <p className="large-help">
-                  Choose your Google account and press <strong>Allow</strong>.
-                  Then come back here.
-                </p>
+                {activeProvider?.auth === "browser" ? (
+                  <>
+                    <h2 id="cloud-setup-title">Look at your web browser</h2>
+                    <p className="large-help">
+                      Sign in to {activeProvider.label} and press{" "}
+                      <strong>Allow</strong>. Then come back here.
+                    </p>
+                  </>
+                ) : (
+                  <>
+                    <h2 id="cloud-setup-title">Checking your details</h2>
+                    <p className="large-help">
+                      CloudFolder is making sure it can reach
+                      {activeProvider ? ` ${activeProvider.label}` : " your cloud"}.
+                    </p>
+                  </>
+                )}
                 <div className="waiting-note">
                   <span className="tiny-spinner" />
                   This page will finish by itself.
@@ -1241,84 +1485,168 @@ export default function App() {
                 <h2 id="cloud-setup-title">Follow the terminal helper</h2>
                 <p className="large-help">
                   Keep choosing the suggested answer. When it finishes, close this
-                  box and press Google Drive again.
+                  box and open Cloud accounts again.
                 </p>
                 <button
                   className="primary giant-button"
                   onClick={async () => {
-                    const nextRemotes = await invoke<string[]>("list_remotes");
-                    setRemotes(nextRemotes);
-                    if (nextRemotes.length > 0) {
-                      setCloudSetupStatus("success");
-                    } else {
-                      setCloudSetupStatus("ready");
-                      setCloudSetupMessage(
-                        "Google Drive is not connected yet. Try the easy setup above.",
-                      );
-                    }
+                    await refresh();
+                    setCloudSetupStatus("picker");
+                    setCloudSetupMessage(null);
                   }}
                 >
                   Check again
                 </button>
               </div>
-            ) : (
-              <>
+            ) : cloudSetupStatus === "form" && activeProvider ? (
+              <form
+                className="cloud-fields-form"
+                onSubmit={(event) => void submitProviderFields(event)}
+              >
                 <div className="cloud-setup-heading">
                   <div className="cloud-setup-icon" aria-hidden="true">☁</div>
                   <div>
-                    <p className="eyebrow">Easy setup</p>
-                    <h2 id="cloud-setup-title">Add Google Drive</h2>
-                    <p>There are only three little steps.</p>
+                    <p className="eyebrow">Enter your details</p>
+                    <h2 id="cloud-setup-title">Connect {activeProvider.label}</h2>
+                    <p>{activeProvider.blurb}</p>
                   </div>
                 </div>
 
-                <ol className="kid-steps">
-                  <li>
-                    <span>1</span>
-                    <div>
-                      <strong>Press the big green button</strong>
-                      <small>Your web browser will open.</small>
-                    </div>
-                  </li>
-                  <li>
-                    <span>2</span>
-                    <div>
-                      <strong>Choose your Google account</strong>
-                      <small>Google may ask you to press Allow.</small>
-                    </div>
-                  </li>
-                  <li>
-                    <span>3</span>
-                    <div>
-                      <strong>Come back to CloudFolder</strong>
-                      <small>We will tell you when everything is ready.</small>
-                    </div>
-                  </li>
-                </ol>
+                {activeProvider.fields.map((field) => (
+                  <label className="cloud-field" key={field.key}>
+                    <span className="field-label">
+                      {field.label}
+                      {!field.required && <em> (optional)</em>}
+                    </span>
+                    {field.choices.length > 0 ? (
+                      <select
+                        value={fieldValues[field.key] ?? field.default}
+                        onChange={(event) => updateField(field, event.target.value)}
+                      >
+                        {field.choices.map((choice) => (
+                          <option value={choice.value} key={choice.value}>
+                            {choice.label}
+                          </option>
+                        ))}
+                      </select>
+                    ) : (
+                      <input
+                        type={field.secret ? "password" : "text"}
+                        value={fieldValues[field.key] ?? ""}
+                        required={field.required}
+                        autoComplete={field.secret ? "new-password" : "off"}
+                        spellCheck={false}
+                        onChange={(event) => updateField(field, event.target.value)}
+                      />
+                    )}
+                    {field.help && <small>{field.help}</small>}
+                  </label>
+                ))}
 
-                {cloudSetupStatus === "error" && (
+                {cloudSetupStatus === "form" && cloudSetupMessage && (
                   <div className="simple-error">
                     <strong>That did not work yet.</strong>
                     <p>{cloudSetupMessage}</p>
                   </div>
                 )}
 
-                <button
-                  className="primary giant-button"
-                  onClick={() => void connectGoogleDrive()}
-                >
-                  {cloudSetupStatus === "error"
-                    ? "Try connecting again"
-                    : "Connect my Google Drive"}
+                <button type="submit" className="primary giant-button">
+                  Connect {activeProvider.label}
                 </button>
                 <div className="privacy-promise">
                   <span>✓</span>
                   <p>
-                    <strong>Your password stays private.</strong>
-                    Google lets CloudFolder browse folders and upload backups.
-                    CloudFolder never deletes Drive files.
+                    <strong>Your details stay on this computer.</strong>
+                    CloudFolder hands them straight to the backup engine and never
+                    shows them again. It never deletes files in the cloud.
                   </p>
                 </div>
+                <button
+                  type="button"
+                  className="advanced-link"
+                  onClick={() => setCloudSetupStatus("picker")}
+                >
+                  Back to all services
+                </button>
+              </form>
+            ) : (
+              <>
+                <div className="cloud-setup-heading">
+                  <div className="cloud-setup-icon" aria-hidden="true">☁</div>
+                  <div>
+                    <p className="eyebrow">Easy setup</p>
+                    <h2 id="cloud-setup-title">Add a cloud account</h2>
+                    <p>Pick where you want your backups to go.</p>
+                  </div>
+                </div>
+
+                {remotes.length > 0 && (
+                  <div className="connected-remotes">
+                    <p className="field-label">Already connected</p>
+                    {remotes.map((remote) => (
+                      <div className="connected-remote" key={remote.name}>
+                        <span aria-hidden="true">✓</span>
+                        <div>
+                          <strong>{remote.label}</strong>
+                          <small>{remote.name.replace(/:$/, "")}</small>
+                        </div>
+                        <button
+                          type="button"
+                          className="link-button"
+                          onClick={() => void disconnectRemote(remote)}
+                        >
+                          Disconnect
+                        </button>
+                      </div>
+                    ))}
+                  </div>
+                )}
+
+                {cloudSetupStatus === "error" && cloudSetupMessage && (
+                  <div className="simple-error">
+                    <strong>That did not work yet.</strong>
+                    <p>{cloudSetupMessage}</p>
+                  </div>
+                )}
+
+                <div className="provider-group">
+                  <p className="field-label">Sign in with your browser</p>
+                  <div className="provider-grid">
+                    {providers
+                      .filter((provider) => provider.auth === "browser")
+                      .map((provider) => (
+                        <button
+                          type="button"
+                          className="provider-tile"
+                          key={provider.id}
+                          onClick={() => startProvider(provider)}
+                        >
+                          <strong>{provider.label}</strong>
+                          <small>{provider.blurb}</small>
+                        </button>
+                      ))}
+                  </div>
+                </div>
+
+                <div className="provider-group">
+                  <p className="field-label">Enter your details</p>
+                  <div className="provider-grid">
+                    {providers
+                      .filter((provider) => provider.auth === "fields")
+                      .map((provider) => (
+                        <button
+                          type="button"
+                          className="provider-tile"
+                          key={provider.id}
+                          onClick={() => startProvider(provider)}
+                        >
+                          <strong>{provider.label}</strong>
+                          <small>{provider.blurb}</small>
+                        </button>
+                      ))}
+                  </div>
+                </div>
+
                 <button
                   className="advanced-link"
                   onClick={() => void openAdvancedCloudSetup()}
@@ -1407,6 +1735,85 @@ export default function App() {
                 )}
               </fieldset>
 
+              <fieldset className="ignore-fieldset">
+                <legend>Make this backup faster</legend>
+                <label className="ignore-preset">
+                  <input
+                    type="checkbox"
+                    checked={developerExcludesEnabled}
+                    onChange={(event) =>
+                      toggleDeveloperExcludes(event.target.checked)
+                    }
+                  />
+                  <span className="ignore-preset-icon" aria-hidden="true">
+                    ⚡
+                  </span>
+                  <span>
+                    <strong>Skip files that coding tools can rebuild</strong>
+                    <small>
+                      Do not upload target, node_modules, or .git folders. Your
+                      source code and personal files are still backed up.
+                    </small>
+                  </span>
+                </label>
+
+                <details className="custom-ignore-rules">
+                  <summary>Add your own skip rule</summary>
+                  <p>
+                    Use <code>**/folder-name/**</code> to skip a folder wherever
+                    it appears.
+                  </p>
+                  <div className="ignore-rule-input">
+                    <input
+                      aria-label="Custom ignore rule"
+                      value={ignorePatternInput}
+                      maxLength={512}
+                      placeholder="**/folder-name/**"
+                      onChange={(event) =>
+                        setIgnorePatternInput(event.target.value)
+                      }
+                      onKeyDown={(event) => {
+                        if (event.key === "Enter") {
+                          event.preventDefault();
+                          addIgnorePattern();
+                        }
+                      }}
+                    />
+                    <button
+                      type="button"
+                      disabled={!ignorePatternInput.trim()}
+                      onClick={addIgnorePattern}
+                    >
+                      Add rule
+                    </button>
+                  </div>
+                </details>
+
+                {draft.exclude_patterns.length > 0 && (
+                  <div className="ignore-rule-list">
+                    <strong>
+                      {draft.exclude_patterns.length} active ignore rule
+                      {draft.exclude_patterns.length === 1 ? "" : "s"}
+                    </strong>
+                    <div>
+                      {draft.exclude_patterns.map((pattern) => (
+                        <span key={pattern}>
+                          <code>{pattern}</code>
+                          <button
+                            type="button"
+                            aria-label={`Remove ignore rule ${pattern}`}
+                            onClick={() => removeIgnorePattern(pattern)}
+                          >
+                            ×
+                          </button>
+                        </span>
+                      ))}
+                    </div>
+                    <small>These files stay on this computer.</small>
+                  </div>
+                )}
+              </fieldset>
+
               <div className="form-row">
                 <label>
                   Google account
@@ -1424,14 +1831,15 @@ export default function App() {
                     <option value="" disabled>
                       Choose an account
                     </option>
-                    {draft.remote && !remotes.includes(draft.remote) && (
+                    {draft.remote &&
+                      !remotes.some((remote) => remote.name === draft.remote) && (
                       <option value={draft.remote}>
                         {draft.remote.replace(/:$/, "")}
                       </option>
                     )}
                     {remotes.map((remote) => (
-                      <option value={remote} key={remote}>
-                        {remote.replace(/:$/, "")}
+                      <option value={remote.name} key={remote.name}>
+                        {remote.label}
                       </option>
                     ))}
                   </select>
@@ -2244,23 +2652,31 @@ export default function App() {
             <div className="activity-heading">
               <span
                 className={`activity-icon ${
-                  activityMayBeStalled
+                  activityIsCancelling
+                    ? "stopping"
+                    : activityMayBeStalled
                     ? "stalled"
                     : activityIsRunning
                       ? "working"
                       : lastActivity?.state === "error"
                         ? "error"
+                        : lastActivity?.state === "cancelled"
+                          ? "cancelled"
                         : "finished"
                 }`}
                 aria-hidden="true"
               >
                 <span>
-                  {activityMayBeStalled
+                  {activityIsCancelling
+                    ? "■"
+                    : activityMayBeStalled
                     ? "!"
                     : activityIsRunning
                       ? "↻"
                       : lastActivity?.state === "error"
                         ? "×"
+                        : lastActivity?.state === "cancelled"
+                          ? "■"
                         : "✓"}
                 </span>
               </span>
@@ -2272,22 +2688,34 @@ export default function App() {
 
             <div
               className={`activity-health ${
-                activityMayBeStalled ? "stalled" : ""
+                activityIsCancelling
+                  ? "stopping"
+                  : activityMayBeStalled
+                    ? "stalled"
+                    : lastActivity?.state === "cancelled"
+                      ? "cancelled"
+                      : ""
               }`}
             >
               <strong>
-                {activityMayBeStalled
+                {activityIsCancelling
+                  ? "Stopping this backup safely…"
+                  : activityMayBeStalled
                   ? `No new message for ${secondsSinceActivity} seconds`
                   : activityIsRunning
                     ? "Your backup is working"
                     : lastActivity?.state === "error"
                       ? "This backup needs attention"
+                      : lastActivity?.state === "cancelled"
+                        ? "This backup was cancelled"
                       : lastActivity?.state === "success"
                         ? "Your backup finished"
                         : "Here is the latest backup activity"}
               </strong>
               <p>
-                {activityMayBeStalled
+                {activityIsCancelling
+                  ? "CloudFolder is stopping the active transfer. Files already uploaded will stay in the cloud."
+                  : activityMayBeStalled
                   ? "It may be scanning a large folder or waiting for the cloud. This is a warning, not proof that it is stuck."
                   : lastActivity?.message ??
                     "Messages will appear here when this backup starts."}
@@ -2326,6 +2754,15 @@ export default function App() {
                 >
                   Copy log
                 </button>
+                {activityIsRunning && (
+                  <button
+                    className="cancel-sync-button"
+                    disabled={activityIsCancelling}
+                    onClick={() => void cancelJob(currentActivityJob)}
+                  >
+                    {activityIsCancelling ? "Stopping…" : "Cancel backup"}
+                  </button>
+                )}
               </div>
             </div>
 
@@ -2408,6 +2845,14 @@ export default function App() {
               <div>
                 <dt>Backup type</dt>
                 <dd>{backupModeLabel(selectedJob.backup_mode)}</dd>
+              </div>
+              <div>
+                <dt>Ignore rules</dt>
+                <dd>
+                  {selectedJob.exclude_patterns?.length
+                    ? `${selectedJob.exclude_patterns.length} active`
+                    : "None — back up every file"}
+                </dd>
               </div>
               <div>
                 <dt>Previous files</dt>

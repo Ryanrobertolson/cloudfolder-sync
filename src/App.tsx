@@ -4,6 +4,7 @@ import { open } from "@tauri-apps/plugin-dialog";
 
 type JobStatus = "ready" | "running" | "success" | "error" | "paused";
 type BackupMode = "full" | "incremental" | "differential" | "mirror";
+type FilterMode = "inherit" | "custom" | "disabled";
 type CloudSetupStatus =
   | "picker"
   | "ready"
@@ -61,7 +62,29 @@ interface SyncJob {
   progress_message: string | null;
   retention_count: number;
   exclude_patterns: string[];
+  size_filter_mode: FilterMode;
+  max_file_size_mib: number | null;
+  extension_filter_mode: FilterMode;
+  excluded_extensions: string[];
   created_at: string;
+}
+
+interface AppSettings {
+  max_file_size_mib: number | null;
+  excluded_extensions: string[];
+}
+
+interface LargeFileExample {
+  path: string;
+  size_bytes: number;
+}
+
+interface LargeFileScanResult {
+  threshold_bytes: number;
+  matching_file_count: number;
+  examples: LargeFileExample[];
+  unreadable_path_count: number;
+  unreadable_examples: string[];
 }
 
 interface RunRecord {
@@ -163,6 +186,10 @@ interface JobDraft {
   backup_mode: BackupMode;
   retention_count: number;
   exclude_patterns: string[];
+  size_filter_mode: FilterMode;
+  max_file_size_mib: number | null;
+  extension_filter_mode: FilterMode;
+  excluded_extensions: string[];
 }
 
 const developerExcludePatterns: string[] = [
@@ -188,6 +215,10 @@ const initialDraft: JobDraft = {
   backup_mode: "incremental",
   retention_count: 5,
   exclude_patterns: [],
+  size_filter_mode: "inherit",
+  max_file_size_mib: 25,
+  extension_filter_mode: "inherit",
+  excluded_extensions: [],
 };
 
 function formatTime(value: string | null): string {
@@ -238,8 +269,11 @@ function backupModeLabel(mode: BackupMode): string {
 }
 
 function formatFileSize(bytes: number | null): string {
-  if (!bytes) return "";
-  return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
+  if (bytes === null || bytes === undefined || bytes <= 0) return "";
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+  return `${(bytes / (1024 * 1024 * 1024)).toFixed(1)} GB`;
 }
 
 function formatLogTime(value: string): string {
@@ -268,6 +302,25 @@ export default function App() {
   const [providers, setProviders] = useState<CloudProvider[]>([]);
   const [draft, setDraft] = useState<JobDraft>(initialDraft);
   const [showCreate, setShowCreate] = useState(false);
+  const [appSettings, setAppSettings] = useState<AppSettings>({
+    max_file_size_mib: null,
+    excluded_extensions: [],
+  });
+  const [settingsDraft, setSettingsDraft] = useState<AppSettings>({
+    max_file_size_mib: null,
+    excluded_extensions: [],
+  });
+  const [showAppFilters, setShowAppFilters] = useState(false);
+  const [settingsError, setSettingsError] = useState<string | null>(null);
+  const [settingsExtensionInput, setSettingsExtensionInput] = useState("");
+  const [jobExtensionInput, setJobExtensionInput] = useState("");
+  const [largeFileScan, setLargeFileScan] =
+    useState<LargeFileScanResult | null>(null);
+  const [largeFileScanError, setLargeFileScanError] = useState<string | null>(null);
+  const [scanningLargeFiles, setScanningLargeFiles] = useState(false);
+  const scanRequestRef = useRef(0);
+  const appFilterButtonRef = useRef<HTMLButtonElement | null>(null);
+  const appFilterModalRef = useRef<HTMLElement | null>(null);
   const [editingJob, setEditingJob] = useState<SyncJob | null>(null);
   const [showCloudSetup, setShowCloudSetup] = useState(false);
   const [cloudSetupStatus, setCloudSetupStatus] =
@@ -340,12 +393,14 @@ export default function App() {
         nextProviders,
         nextErrorLogs,
         nextServiceStatus,
+        nextAppSettings,
       ] = await Promise.all([
         invoke<SyncJob[]>("list_jobs"),
         invoke<RemoteInfo[]>("list_remotes"),
         invoke<CloudProvider[]>("list_providers"),
         invoke<ErrorLog[]>("list_error_logs"),
         invoke<BackgroundServiceStatus>("background_service_status"),
+        invoke<AppSettings>("get_app_settings"),
       ]);
       const safeJobs = nextJobs ?? [];
       const safeRemotes = nextRemotes ?? [];
@@ -354,6 +409,7 @@ export default function App() {
       setProviders(nextProviders ?? []);
       setErrorLogs(nextErrorLogs ?? []);
       if (nextServiceStatus) setServiceStatus(nextServiceStatus);
+      if (nextAppSettings) setAppSettings(nextAppSettings);
       setDraft((current) => ({
         ...current,
         remote: current.remote || safeRemotes[0]?.name || "",
@@ -480,27 +536,153 @@ export default function App() {
     activityLogRef.current.scrollTop = activityLogRef.current.scrollHeight;
   }, [activityAutoScroll, activityEntries]);
 
+  async function scanSources(paths: string[]) {
+    const requestId = ++scanRequestRef.current;
+    if (paths.length === 0) {
+      setLargeFileScan(null);
+      setLargeFileScanError(null);
+      setScanningLargeFiles(false);
+      return;
+    }
+    setLargeFileScan(null);
+    setLargeFileScanError(null);
+    setScanningLargeFiles(true);
+    try {
+      const result = await invoke<LargeFileScanResult>("scan_large_files", {
+        paths,
+      });
+      if (requestId === scanRequestRef.current) setLargeFileScan(result);
+    } catch (reason) {
+      if (requestId === scanRequestRef.current) {
+        setLargeFileScan(null);
+        setLargeFileScanError(
+          `Could not check selected files for large items: ${reason}`,
+        );
+      }
+    } finally {
+      if (requestId === scanRequestRef.current) setScanningLargeFiles(false);
+    }
+  }
+
   async function chooseSource(directory: boolean) {
     const selected = await open({ directory, multiple: true });
     if (!selected) return;
     const additions = Array.isArray(selected) ? selected : [selected];
     if (additions.length === 0) return;
+    const sourcePaths = Array.from(
+      new Set([...draft.source_paths, ...additions]),
+    );
     setDraft((current) => ({
       ...current,
-      source_paths: Array.from(
-        new Set([...current.source_paths, ...additions]),
-      ),
+      source_paths: sourcePaths,
       name:
         current.name ||
         (additions[0].split("/").filter(Boolean).pop() ?? "My backup"),
     }));
+    void scanSources(sourcePaths);
   }
 
   function removeSource(path: string) {
+    const sourcePaths = draft.source_paths.filter((source) => source !== path);
     setDraft((current) => ({
       ...current,
-      source_paths: current.source_paths.filter((source) => source !== path),
+      source_paths: sourcePaths,
     }));
+    void scanSources(sourcePaths);
+  }
+
+  function normalizedExtension(value: string): string {
+    return value.trim().replace(/^\./, "").toLowerCase();
+  }
+
+  function addJobExtension() {
+    const extension = normalizedExtension(jobExtensionInput);
+    if (!extension || draft.excluded_extensions.includes(extension)) return;
+    setDraft((current) => ({
+      ...current,
+      excluded_extensions: [...current.excluded_extensions, extension],
+    }));
+    setJobExtensionInput("");
+  }
+
+  function addSettingsExtension() {
+    const extension = normalizedExtension(settingsExtensionInput);
+    if (!extension || settingsDraft.excluded_extensions.includes(extension)) return;
+    setSettingsDraft((current) => ({
+      ...current,
+      excluded_extensions: [...current.excluded_extensions, extension],
+    }));
+    setSettingsExtensionInput("");
+  }
+
+  function openAppFilterSettings() {
+    setSettingsDraft({
+      max_file_size_mib: appSettings.max_file_size_mib,
+      excluded_extensions: [...appSettings.excluded_extensions],
+    });
+    setSettingsExtensionInput("");
+    setSettingsError(null);
+    setShowAppFilters(true);
+  }
+
+  function closeAppFilterSettings() {
+    setShowAppFilters(false);
+    setSettingsError(null);
+    window.requestAnimationFrame(() => appFilterButtonRef.current?.focus());
+  }
+
+  function handleAppFilterModalKeyDown(
+    event: React.KeyboardEvent<HTMLElement>,
+  ) {
+    if (event.key === "Escape") {
+      event.preventDefault();
+      closeAppFilterSettings();
+      return;
+    }
+    if (event.key !== "Tab" || !appFilterModalRef.current) return;
+    const focusable = Array.from(
+      appFilterModalRef.current.querySelectorAll<HTMLElement>(
+        'button:not([disabled]), input:not([disabled]), select:not([disabled]), [tabindex]:not([tabindex="-1"])',
+      ),
+    );
+    if (focusable.length === 0) return;
+    const first = focusable[0];
+    const last = focusable[focusable.length - 1];
+    if (event.shiftKey && document.activeElement === first) {
+      event.preventDefault();
+      last.focus();
+    } else if (!event.shiftKey && document.activeElement === last) {
+      event.preventDefault();
+      first.focus();
+    }
+  }
+
+  async function saveAppFilterSettings(event: React.FormEvent) {
+    event.preventDefault();
+    setSaving(true);
+    setSettingsError(null);
+    try {
+      const pendingExtension = normalizedExtension(settingsExtensionInput);
+      const excludedExtensions =
+        pendingExtension &&
+        !settingsDraft.excluded_extensions.includes(pendingExtension)
+          ? [...settingsDraft.excluded_extensions, pendingExtension]
+          : settingsDraft.excluded_extensions;
+      const saved = await invoke<AppSettings>("update_app_settings", {
+        input: {
+          ...settingsDraft,
+          excluded_extensions: excludedExtensions,
+        },
+      });
+      setAppSettings(saved);
+      setSettingsDraft(saved);
+      closeAppFilterSettings();
+      setNotice("App-wide file filters were updated.");
+    } catch (reason) {
+      setSettingsError(String(reason));
+    } finally {
+      setSaving(false);
+    }
   }
 
   function toggleDeveloperExcludes(enabled: boolean) {
@@ -584,15 +766,21 @@ export default function App() {
   }
 
   function openNewJob() {
+    scanRequestRef.current += 1;
     setEditingJob(null);
     setDraft({ ...initialDraft, remote: remotes[0]?.name || "" });
     setScheduleEditor(initialDraft.interval_minutes);
     setMirrorAcknowledged(false);
     setIgnorePatternInput("");
+    setJobExtensionInput("");
+    setLargeFileScan(null);
+    setLargeFileScanError(null);
+    setScanningLargeFiles(false);
     setShowCreate(true);
   }
 
   function openEditJob(job: SyncJob) {
+    scanRequestRef.current += 1;
     const matchingRemote = remotes.find((remote) =>
       job.destination.startsWith(remote.name),
     );
@@ -610,15 +798,27 @@ export default function App() {
       backup_mode: job.backup_mode,
       retention_count: job.retention_count,
       exclude_patterns: [...(job.exclude_patterns ?? [])],
+      size_filter_mode: job.size_filter_mode ?? "inherit",
+      max_file_size_mib: job.max_file_size_mib ?? 25,
+      extension_filter_mode: job.extension_filter_mode ?? "inherit",
+      excluded_extensions: [...(job.excluded_extensions ?? [])],
     });
     setScheduleEditor(job.interval_minutes);
     setMirrorAcknowledged(job.backup_mode === "mirror");
     setIgnorePatternInput("");
+    setJobExtensionInput("");
+    setLargeFileScan(null);
+    setLargeFileScanError(null);
+    setScanningLargeFiles(false);
     setSelectedJob(null);
     setShowCreate(true);
   }
 
   function closeJobForm() {
+    scanRequestRef.current += 1;
+    setLargeFileScan(null);
+    setLargeFileScanError(null);
+    setScanningLargeFiles(false);
     setShowCreate(false);
     setEditingJob(null);
   }
@@ -629,6 +829,13 @@ export default function App() {
     setError(null);
     try {
       const cleanCloudPath = (draft.cloud_path ?? "").replace(/^\/+/, "");
+      const pendingExtension = normalizedExtension(jobExtensionInput);
+      const excludedExtensions =
+        draft.extension_filter_mode === "custom" &&
+        pendingExtension &&
+        !draft.excluded_extensions.includes(pendingExtension)
+          ? [...draft.excluded_extensions, pendingExtension]
+          : draft.excluded_extensions;
       const input = {
         name: draft.name,
         source_paths: draft.source_paths,
@@ -637,6 +844,13 @@ export default function App() {
         backup_mode: draft.backup_mode,
         retention_count: Number(draft.retention_count),
         exclude_patterns: draft.exclude_patterns,
+        size_filter_mode: draft.size_filter_mode,
+        max_file_size_mib:
+          draft.size_filter_mode === "custom"
+            ? Number(draft.max_file_size_mib)
+            : null,
+        extension_filter_mode: draft.extension_filter_mode,
+        excluded_extensions: excludedExtensions,
       };
       await invoke<SyncJob>(editingJob ? "update_job" : "create_job", {
         ...(editingJob ? { jobId: editingJob.id } : {}),
@@ -651,6 +865,11 @@ export default function App() {
       setCustomIntervalUnit("hours");
       setMirrorAcknowledged(false);
       setIgnorePatternInput("");
+      setJobExtensionInput("");
+      scanRequestRef.current += 1;
+      setLargeFileScan(null);
+      setLargeFileScanError(null);
+      setScanningLargeFiles(false);
       setShowCreate(false);
       setEditingJob(null);
       setNotice(successMessage);
@@ -1113,7 +1332,11 @@ export default function App() {
 
   return (
     <div className="app-shell">
-      <aside className="sidebar">
+      <aside
+        className="sidebar"
+        inert={showAppFilters ? true : undefined}
+        aria-hidden={showAppFilters || undefined}
+      >
         <div className="brand">
           <div className="brand-mark" aria-hidden="true">
             <span />
@@ -1133,6 +1356,15 @@ export default function App() {
           <button className="nav-item" onClick={() => configureCloud()}>
             <span>☁</span> Cloud accounts
             {remotes.length > 0 && <b>{remotes.length}</b>}
+          </button>
+          <button
+            ref={appFilterButtonRef}
+            className="nav-item"
+            onClick={openAppFilterSettings}
+          >
+            <span>⇵</span> App filters
+            {(appSettings.max_file_size_mib ||
+              appSettings.excluded_extensions.length > 0) && <b>On</b>}
           </button>
           <button className="nav-item" onClick={() => void openErrorLog()}>
             <span>!</span> Error log
@@ -1169,7 +1401,10 @@ export default function App() {
         </button>
       </aside>
 
-      <main>
+      <main
+        inert={showAppFilters ? true : undefined}
+        aria-hidden={showAppFilters || undefined}
+      >
         <header className="topbar">
           <div>
             <p className="eyebrow">This computer</p>
@@ -1659,6 +1894,160 @@ export default function App() {
         </div>
       )}
 
+      {showAppFilters && (
+        <div className="modal-backdrop" onMouseDown={closeAppFilterSettings}>
+          <section
+            ref={appFilterModalRef}
+            className="modal filter-settings-modal"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="app-filters-title"
+            onMouseDown={(event) => event.stopPropagation()}
+            onKeyDown={handleAppFilterModalKeyDown}
+          >
+            <button
+              className="modal-close"
+              aria-label="Close app filters"
+              onClick={closeAppFilterSettings}
+            >
+              ×
+            </button>
+            <p className="eyebrow">Every backup by default</p>
+            <h2 id="app-filters-title">App-wide file filters</h2>
+            <p className="modal-intro">
+              Existing and new backups inherit these defaults unless you override
+              them on an individual backup.
+            </p>
+            <form onSubmit={saveAppFilterSettings}>
+              <fieldset className="file-filter-panel">
+                <legend>Maximum file size</legend>
+                <label>
+                  Default limit
+                  <select
+                    autoFocus
+                    value={
+                      settingsDraft.max_file_size_mib === null
+                        ? "none"
+                        : [25, 50, 100, 500, 1024].includes(
+                              settingsDraft.max_file_size_mib,
+                            )
+                          ? String(settingsDraft.max_file_size_mib)
+                          : "custom"
+                    }
+                    onChange={(event) =>
+                      setSettingsDraft((current) => ({
+                        ...current,
+                        max_file_size_mib:
+                          event.target.value === "none"
+                            ? null
+                            : event.target.value === "custom"
+                              ? current.max_file_size_mib ?? 25
+                              : Number(event.target.value),
+                      }))
+                    }
+                  >
+                    <option value="none">No size limit</option>
+                    <option value="25">25 MiB</option>
+                    <option value="50">50 MiB</option>
+                    <option value="100">100 MiB</option>
+                    <option value="500">500 MiB</option>
+                    <option value="1024">1 GiB</option>
+                    <option value="custom">Custom</option>
+                  </select>
+                </label>
+                {settingsDraft.max_file_size_mib !== null && (
+                  <label>
+                    Limit in MiB
+                    <input
+                      type="number"
+                      min={1}
+                      max={8388608}
+                      required
+                      value={settingsDraft.max_file_size_mib}
+                      onChange={(event) =>
+                        setSettingsDraft((current) => ({
+                          ...current,
+                          max_file_size_mib: Number(event.target.value),
+                        }))
+                      }
+                    />
+                  </label>
+                )}
+              </fieldset>
+
+              <fieldset className="file-filter-panel">
+                <legend>File extensions to skip</legend>
+                <p className="field-help">
+                  Enter an extension without a wildcard, for example <code>iso</code>
+                  or <code>zip</code>. Matching is case-insensitive.
+                </p>
+                <div className="ignore-rule-input">
+                  <input
+                    aria-label="App-wide excluded extension"
+                    value={settingsExtensionInput}
+                    maxLength={33}
+                    placeholder="iso"
+                    onChange={(event) => setSettingsExtensionInput(event.target.value)}
+                    onKeyDown={(event) => {
+                      if (event.key === "Enter") {
+                        event.preventDefault();
+                        addSettingsExtension();
+                      }
+                    }}
+                  />
+                  <button
+                    type="button"
+                    disabled={!settingsExtensionInput.trim()}
+                    onClick={addSettingsExtension}
+                  >
+                    Add extension
+                  </button>
+                </div>
+                {settingsDraft.excluded_extensions.length > 0 && (
+                  <div className="extension-chip-list">
+                    {settingsDraft.excluded_extensions.map((extension) => (
+                      <span key={extension}>
+                        <code>.{extension}</code>
+                        <button
+                          type="button"
+                          aria-label={`Remove .${extension}`}
+                          onClick={() =>
+                            setSettingsDraft((current) => ({
+                              ...current,
+                              excluded_extensions:
+                                current.excluded_extensions.filter(
+                                  (existing) => existing !== extension,
+                                ),
+                            }))
+                          }
+                        >
+                          ×
+                        </button>
+                      </span>
+                    ))}
+                  </div>
+                )}
+              </fieldset>
+              {settingsError && (
+                <div className="inline-error">{settingsError}</div>
+              )}
+              <div className="modal-actions">
+                <button
+                  type="button"
+                  className="secondary"
+                  onClick={closeAppFilterSettings}
+                >
+                  Cancel
+                </button>
+                <button className="primary" disabled={saving}>
+                  {saving ? "Saving…" : "Save app filters"}
+                </button>
+              </div>
+            </form>
+          </section>
+        </div>
+      )}
+
       {showCreate && (
         <div className="modal-backdrop" onMouseDown={closeJobForm}>
           <section
@@ -1733,6 +2122,64 @@ export default function App() {
                     cannot overwrite each other.
                   </p>
                 )}
+                {scanningLargeFiles && (
+                  <p className="scan-status">Checking for files over 25 MiB…</p>
+                )}
+                {largeFileScanError && (
+                  <div className="inline-error scan-error">{largeFileScanError}</div>
+                )}
+                {largeFileScan &&
+                  (largeFileScan.matching_file_count > 0 ||
+                    largeFileScan.unreadable_path_count > 0) && (
+                    <div className="large-file-warning" role="status">
+                      <span aria-hidden="true">!</span>
+                      <div>
+                        {largeFileScan.matching_file_count > 0 ? (
+                          <>
+                            <strong>
+                              {largeFileScan.matching_file_count} file
+                              {largeFileScan.matching_file_count === 1 ? "" : "s"} over
+                              25 MiB
+                            </strong>
+                            <p>
+                              Large files can make a backup take longer and use more
+                              cloud storage. They will still be backed up unless you set
+                              a limit.
+                            </p>
+                            <ul>
+                              {largeFileScan.examples.map((file) => (
+                                <li key={file.path} title={file.path}>
+                                  {shortPath(file.path)} — {formatFileSize(file.size_bytes)}
+                                </li>
+                              ))}
+                            </ul>
+                            <button
+                              type="button"
+                              className="secondary"
+                              onClick={() =>
+                                setDraft((current) => ({
+                                  ...current,
+                                  size_filter_mode: "custom",
+                                  max_file_size_mib: 25,
+                                }))
+                              }
+                            >
+                              Skip files over 25 MiB
+                            </button>
+                          </>
+                        ) : (
+                          <strong>No large files found in the paths that were checked.</strong>
+                        )}
+                        {largeFileScan.unreadable_path_count > 0 && (
+                          <small>
+                            {largeFileScan.unreadable_path_count} path
+                            {largeFileScan.unreadable_path_count === 1 ? " was" : "s were"}
+                            {" "}not readable, so this check may be incomplete.
+                          </small>
+                        )}
+                      </div>
+                    </div>
+                  )}
               </fieldset>
 
               <fieldset className="ignore-fieldset">
@@ -1812,6 +2259,170 @@ export default function App() {
                     <small>These files stay on this computer.</small>
                   </div>
                 )}
+
+                <div className="file-filter-grid">
+                  <section className="file-filter-panel">
+                    <strong>Skip large files</strong>
+                    <label>
+                      Size rule
+                      <select
+                        value={draft.size_filter_mode}
+                        onChange={(event) =>
+                          setDraft((current) => ({
+                            ...current,
+                            size_filter_mode: event.target.value as FilterMode,
+                            max_file_size_mib:
+                              event.target.value === "custom"
+                                ? current.max_file_size_mib ?? 25
+                                : current.max_file_size_mib,
+                          }))
+                        }
+                      >
+                        <option value="inherit">Use app default</option>
+                        <option value="custom">Set for this backup</option>
+                        <option value="disabled">No size limit</option>
+                      </select>
+                    </label>
+                    {draft.size_filter_mode === "inherit" && (
+                      <small>
+                        App default: {appSettings.max_file_size_mib
+                          ? `${appSettings.max_file_size_mib} MiB`
+                          : "no size limit"}
+                      </small>
+                    )}
+                    {draft.size_filter_mode === "custom" && (
+                      <>
+                        <label>
+                          Preset
+                          <select
+                            value={
+                              [25, 50, 100, 500, 1024].includes(
+                                draft.max_file_size_mib ?? 0,
+                              )
+                                ? String(draft.max_file_size_mib)
+                                : "custom"
+                            }
+                            onChange={(event) =>
+                              setDraft((current) => ({
+                                ...current,
+                                max_file_size_mib:
+                                  event.target.value === "custom"
+                                    ? current.max_file_size_mib ?? 25
+                                    : Number(event.target.value),
+                              }))
+                            }
+                          >
+                            <option value="25">25 MiB</option>
+                            <option value="50">50 MiB</option>
+                            <option value="100">100 MiB</option>
+                            <option value="500">500 MiB</option>
+                            <option value="1024">1 GiB</option>
+                            <option value="custom">Custom</option>
+                          </select>
+                        </label>
+                        <label>
+                          Limit in MiB
+                          <input
+                            type="number"
+                            min={1}
+                            max={8388608}
+                            required
+                            value={draft.max_file_size_mib ?? ""}
+                            onChange={(event) =>
+                              setDraft((current) => ({
+                                ...current,
+                                max_file_size_mib: event.target.value
+                                  ? Number(event.target.value)
+                                  : null,
+                              }))
+                            }
+                          />
+                        </label>
+                      </>
+                    )}
+                  </section>
+
+                  <section className="file-filter-panel">
+                    <strong>Skip file types</strong>
+                    <label>
+                      Extension rule
+                      <select
+                        value={draft.extension_filter_mode}
+                        onChange={(event) =>
+                          setDraft((current) => ({
+                            ...current,
+                            extension_filter_mode: event.target.value as FilterMode,
+                          }))
+                        }
+                      >
+                        <option value="inherit">Use app default</option>
+                        <option value="custom">Set for this backup</option>
+                        <option value="disabled">Back up every type</option>
+                      </select>
+                    </label>
+                    {draft.extension_filter_mode === "inherit" && (
+                      <small>
+                        App default: {appSettings.excluded_extensions.length
+                          ? appSettings.excluded_extensions
+                              .map((extension) => `.${extension}`)
+                              .join(", ")
+                          : "no extensions skipped"}
+                      </small>
+                    )}
+                    {draft.extension_filter_mode === "custom" && (
+                      <>
+                        <div className="ignore-rule-input compact">
+                          <input
+                            aria-label="Excluded extension for this backup"
+                            value={jobExtensionInput}
+                            maxLength={33}
+                            placeholder="iso"
+                            onChange={(event) => setJobExtensionInput(event.target.value)}
+                            onKeyDown={(event) => {
+                              if (event.key === "Enter") {
+                                event.preventDefault();
+                                addJobExtension();
+                              }
+                            }}
+                          />
+                          <button
+                            type="button"
+                            disabled={!jobExtensionInput.trim()}
+                            onClick={addJobExtension}
+                          >
+                            Add
+                          </button>
+                        </div>
+                        {draft.excluded_extensions.length > 0 ? (
+                          <div className="extension-chip-list">
+                            {draft.excluded_extensions.map((extension) => (
+                              <span key={extension}>
+                                <code>.{extension}</code>
+                                <button
+                                  type="button"
+                                  aria-label={`Remove .${extension}`}
+                                  onClick={() =>
+                                    setDraft((current) => ({
+                                      ...current,
+                                      excluded_extensions:
+                                        current.excluded_extensions.filter(
+                                          (existing) => existing !== extension,
+                                        ),
+                                    }))
+                                  }
+                                >
+                                  ×
+                                </button>
+                              </span>
+                            ))}
+                          </div>
+                        ) : (
+                          <small>Add at least one extension, such as .iso or .zip.</small>
+                        )}
+                      </>
+                    )}
+                  </section>
+                </div>
               </fieldset>
 
               <div className="form-row">
@@ -2852,6 +3463,36 @@ export default function App() {
                   {selectedJob.exclude_patterns?.length
                     ? `${selectedJob.exclude_patterns.length} active`
                     : "None — back up every file"}
+                </dd>
+              </div>
+              <div>
+                <dt>Maximum file size</dt>
+                <dd>
+                  {selectedJob.size_filter_mode === "disabled"
+                    ? "No limit for this backup"
+                    : selectedJob.size_filter_mode === "custom"
+                      ? `${selectedJob.max_file_size_mib} MiB`
+                      : appSettings.max_file_size_mib
+                        ? `${appSettings.max_file_size_mib} MiB (app default)`
+                        : "No limit (app default)"}
+                </dd>
+              </div>
+              <div>
+                <dt>File types skipped</dt>
+                <dd>
+                  {selectedJob.extension_filter_mode === "disabled"
+                    ? "None for this backup"
+                    : selectedJob.extension_filter_mode === "custom"
+                      ? selectedJob.excluded_extensions.length
+                        ? selectedJob.excluded_extensions
+                            .map((extension) => `.${extension}`)
+                            .join(", ")
+                        : "None"
+                      : appSettings.excluded_extensions.length
+                        ? `${appSettings.excluded_extensions
+                            .map((extension) => `.${extension}`)
+                            .join(", ")} (app default)`
+                        : "None (app default)"}
                 </dd>
               </div>
               <div>

@@ -50,6 +50,9 @@ impl Serialize for AppError {
 
 type AppResult<T> = Result<T, AppError>;
 
+const LARGE_FILE_WARNING_BYTES: u64 = 25 * 1024 * 1024;
+const SCAN_EXAMPLE_LIMIT: usize = 5;
+
 #[derive(Debug, Clone, Serialize)]
 struct SyncJob {
     id: i64,
@@ -68,6 +71,10 @@ struct SyncJob {
     progress_message: Option<String>,
     retention_count: i64,
     exclude_patterns: Vec<String>,
+    size_filter_mode: String,
+    max_file_size_mib: Option<i64>,
+    extension_filter_mode: String,
+    excluded_extensions: Vec<String>,
     created_at: String,
 }
 
@@ -81,6 +88,46 @@ struct NewJob {
     retention_count: i64,
     #[serde(default)]
     exclude_patterns: Vec<String>,
+    #[serde(default = "default_filter_mode")]
+    size_filter_mode: String,
+    #[serde(default)]
+    max_file_size_mib: Option<i64>,
+    #[serde(default = "default_filter_mode")]
+    extension_filter_mode: String,
+    #[serde(default)]
+    excluded_extensions: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct AppSettings {
+    max_file_size_mib: Option<i64>,
+    #[serde(default)]
+    excluded_extensions: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct EffectiveFilters {
+    max_file_size_mib: Option<i64>,
+    excluded_extensions: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct LargeFileExample {
+    path: String,
+    size_bytes: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct LargeFileScanResult {
+    threshold_bytes: u64,
+    matching_file_count: u64,
+    examples: Vec<LargeFileExample>,
+    unreadable_path_count: u64,
+    unreadable_examples: Vec<String>,
+}
+
+fn default_filter_mode() -> String {
+    "inherit".into()
 }
 
 #[derive(Debug, Serialize)]
@@ -232,9 +279,22 @@ fn initialize_database(path: &Path) -> AppResult<()> {
             progress_message TEXT,
             retention_count  INTEGER NOT NULL DEFAULT 5,
             exclude_patterns TEXT NOT NULL DEFAULT '[]',
+            size_filter_mode TEXT NOT NULL DEFAULT 'inherit',
+            max_file_size_mib INTEGER,
+            extension_filter_mode TEXT NOT NULL DEFAULT 'inherit',
+            excluded_extensions TEXT NOT NULL DEFAULT '[]',
             cancel_requested INTEGER NOT NULL DEFAULT 0,
             created_at       TEXT NOT NULL
         );
+
+        CREATE TABLE IF NOT EXISTS app_settings (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            max_file_size_mib INTEGER,
+            excluded_extensions TEXT NOT NULL DEFAULT '[]'
+        );
+
+        INSERT OR IGNORE INTO app_settings (id, max_file_size_mib, excluded_extensions)
+        VALUES (1, NULL, '[]');
 
         CREATE TABLE IF NOT EXISTS runs (
             id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -296,6 +356,26 @@ fn initialize_database(path: &Path) -> AppResult<()> {
         "cancel_requested",
         "ALTER TABLE jobs ADD COLUMN cancel_requested INTEGER NOT NULL DEFAULT 0",
     )?;
+    ensure_job_column(
+        &connection,
+        "size_filter_mode",
+        "ALTER TABLE jobs ADD COLUMN size_filter_mode TEXT NOT NULL DEFAULT 'inherit'",
+    )?;
+    ensure_job_column(
+        &connection,
+        "max_file_size_mib",
+        "ALTER TABLE jobs ADD COLUMN max_file_size_mib INTEGER",
+    )?;
+    ensure_job_column(
+        &connection,
+        "extension_filter_mode",
+        "ALTER TABLE jobs ADD COLUMN extension_filter_mode TEXT NOT NULL DEFAULT 'inherit'",
+    )?;
+    ensure_job_column(
+        &connection,
+        "excluded_extensions",
+        "ALTER TABLE jobs ADD COLUMN excluded_extensions TEXT NOT NULL DEFAULT '[]'",
+    )?;
     Ok(())
 }
 
@@ -354,6 +434,7 @@ fn ensure_job_column(connection: &Connection, column: &str, migration: &str) -> 
 fn map_job(row: &rusqlite::Row<'_>) -> rusqlite::Result<SyncJob> {
     let stored_source: String = row.get(2)?;
     let stored_exclude_patterns: String = row.get(15)?;
+    let stored_excluded_extensions: String = row.get(19)?;
     Ok(SyncJob {
         id: row.get(0)?,
         name: row.get(1)?,
@@ -371,7 +452,11 @@ fn map_job(row: &rusqlite::Row<'_>) -> rusqlite::Result<SyncJob> {
         progress_message: row.get(13)?,
         retention_count: row.get(14)?,
         exclude_patterns: decode_exclude_patterns(&stored_exclude_patterns),
-        created_at: row.get(16)?,
+        size_filter_mode: row.get(16)?,
+        max_file_size_mib: row.get(17)?,
+        extension_filter_mode: row.get(18)?,
+        excluded_extensions: decode_exclude_patterns(&stored_excluded_extensions),
+        created_at: row.get(20)?,
     })
 }
 
@@ -394,13 +479,213 @@ fn clean_exclude_patterns(patterns: &[String]) -> Vec<String> {
         .collect()
 }
 
+fn clean_extensions(extensions: &[String]) -> AppResult<Vec<String>> {
+    if extensions.len() > 100 {
+        return Err(AppError::Validation(
+            "You can skip up to 100 file extensions".into(),
+        ));
+    }
+    let mut cleaned = Vec::with_capacity(extensions.len());
+    let mut seen = HashSet::new();
+    for extension in extensions {
+        let trimmed = extension.trim();
+        let normalized = trimmed
+            .strip_prefix('.')
+            .unwrap_or(trimmed)
+            .to_ascii_lowercase();
+        if normalized.is_empty()
+            || normalized.len() > 32
+            || !normalized.chars().all(|character| {
+                character.is_ascii_alphanumeric() || matches!(character, '+' | '-' | '_')
+            })
+        {
+            return Err(AppError::Validation(
+                "File extensions must be 1–32 letters or numbers; +, - and _ are also allowed"
+                    .into(),
+            ));
+        }
+        if !seen.insert(normalized.clone()) {
+            return Err(AppError::Validation(
+                "The same file extension was added more than once".into(),
+            ));
+        }
+        cleaned.push(normalized);
+    }
+    Ok(cleaned)
+}
+
+fn validate_max_file_size(value: Option<i64>) -> AppResult<()> {
+    if value.is_some_and(|size| !(1..=8_388_608).contains(&size)) {
+        return Err(AppError::Validation(
+            "Maximum file size must be between 1 MiB and 8,388,608 MiB".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_filter_mode(mode: &str) -> AppResult<()> {
+    if matches!(mode, "inherit" | "custom" | "disabled") {
+        Ok(())
+    } else {
+        Err(AppError::Validation(
+            "Choose whether this backup inherits, customizes, or disables the app filter".into(),
+        ))
+    }
+}
+
+fn resolve_filter_values(
+    size_mode: &str,
+    max_file_size_mib: Option<i64>,
+    extension_mode: &str,
+    excluded_extensions: &[String],
+    settings: &AppSettings,
+) -> AppResult<EffectiveFilters> {
+    validate_filter_mode(size_mode)?;
+    validate_filter_mode(extension_mode)?;
+    let max_file_size_mib = match size_mode {
+        "inherit" => settings.max_file_size_mib,
+        "custom" => max_file_size_mib,
+        "disabled" => None,
+        _ => unreachable!(),
+    };
+    if size_mode == "custom" && max_file_size_mib.is_none() {
+        return Err(AppError::Validation(
+            "Enter a maximum file size for this backup".into(),
+        ));
+    }
+    validate_max_file_size(max_file_size_mib)?;
+    let excluded_extensions = match extension_mode {
+        "inherit" => settings.excluded_extensions.clone(),
+        "custom" => clean_extensions(excluded_extensions)?,
+        "disabled" => Vec::new(),
+        _ => unreachable!(),
+    };
+    Ok(EffectiveFilters {
+        max_file_size_mib,
+        excluded_extensions,
+    })
+}
+
+fn load_app_settings(connection: &Connection) -> AppResult<AppSettings> {
+    let (max_file_size_mib, stored_extensions): (Option<i64>, String) = connection.query_row(
+        "SELECT max_file_size_mib, excluded_extensions FROM app_settings WHERE id = 1",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    Ok(AppSettings {
+        max_file_size_mib,
+        excluded_extensions: decode_exclude_patterns(&stored_extensions),
+    })
+}
+
+fn scan_paths_for_large_files(
+    paths: &[String],
+    threshold_bytes: u64,
+) -> AppResult<LargeFileScanResult> {
+    if paths.is_empty() {
+        return Err(AppError::Validation(
+            "Choose at least one file or folder to scan".into(),
+        ));
+    }
+    let mut result = LargeFileScanResult {
+        threshold_bytes,
+        matching_file_count: 0,
+        examples: Vec::new(),
+        unreadable_path_count: 0,
+        unreadable_examples: Vec::new(),
+    };
+    let mut inspected_root = false;
+    let mut visited = HashSet::new();
+    let mut pending = paths.iter().map(PathBuf::from).collect::<Vec<_>>();
+    while let Some(path) = pending.pop() {
+        if !visited.insert(path.clone()) {
+            continue;
+        }
+        let metadata = match std::fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(_) => {
+                result.unreadable_path_count += 1;
+                if result.unreadable_examples.len() < SCAN_EXAMPLE_LIMIT {
+                    result
+                        .unreadable_examples
+                        .push(path.to_string_lossy().into_owned());
+                }
+                continue;
+            }
+        };
+        if paths.iter().any(|root| Path::new(root) == path) {
+            inspected_root = true;
+        }
+        let file_type = metadata.file_type();
+        if file_type.is_symlink() {
+            continue;
+        }
+        if file_type.is_dir() {
+            match std::fs::read_dir(&path) {
+                Ok(entries) => {
+                    for entry in entries {
+                        match entry {
+                            Ok(entry) => pending.push(entry.path()),
+                            Err(_) => {
+                                result.unreadable_path_count += 1;
+                                if result.unreadable_examples.len() < SCAN_EXAMPLE_LIMIT {
+                                    result
+                                        .unreadable_examples
+                                        .push(path.to_string_lossy().into_owned());
+                                }
+                            }
+                        }
+                    }
+                }
+                Err(_) => {
+                    result.unreadable_path_count += 1;
+                    if result.unreadable_examples.len() < SCAN_EXAMPLE_LIMIT {
+                        result
+                            .unreadable_examples
+                            .push(path.to_string_lossy().into_owned());
+                    }
+                }
+            }
+            continue;
+        }
+        if file_type.is_file() && metadata.len() > threshold_bytes {
+            result.matching_file_count += 1;
+            result.examples.push(LargeFileExample {
+                path: path.to_string_lossy().into_owned(),
+                size_bytes: metadata.len(),
+            });
+            result
+                .examples
+                .sort_by_key(|example| std::cmp::Reverse(example.size_bytes));
+            result.examples.truncate(SCAN_EXAMPLE_LIMIT);
+        }
+    }
+    if !inspected_root {
+        return Err(AppError::Validation(
+            "None of the selected files or folders could be inspected".into(),
+        ));
+    }
+    Ok(result)
+}
+
+#[tauri::command]
+async fn scan_large_files(paths: Vec<String>) -> AppResult<LargeFileScanResult> {
+    tokio::task::spawn_blocking(move || {
+        scan_paths_for_large_files(&paths, LARGE_FILE_WARNING_BYTES)
+    })
+    .await
+    .map_err(|error| AppError::Transfer(format!("The large-file scan stopped: {error}")))?
+}
+
 fn get_job(connection: &Connection, job_id: i64) -> AppResult<SyncJob> {
     connection
         .query_row(
             "SELECT id, name, source_path, destination, interval_minutes,
                     backup_mode, last_full_at, enabled, last_run_at, next_run_at,
                     status, last_message, progress_percent, progress_message,
-                    retention_count, exclude_patterns, created_at
+                    retention_count, exclude_patterns, size_filter_mode,
+                    max_file_size_mib, extension_filter_mode, excluded_extensions,
+                    created_at
              FROM jobs WHERE id = ?1",
             [job_id],
             map_job,
@@ -431,6 +716,15 @@ fn validate_new_job(input: &NewJob) -> AppResult<()> {
             "Choose between 1 and 50 previous backups, or turn previous files off".into(),
         ));
     }
+    validate_filter_mode(&input.size_filter_mode)?;
+    validate_filter_mode(&input.extension_filter_mode)?;
+    if input.size_filter_mode == "custom" && input.max_file_size_mib.is_none() {
+        return Err(AppError::Validation(
+            "Enter a maximum file size for this backup".into(),
+        ));
+    }
+    validate_max_file_size(input.max_file_size_mib)?;
+    clean_extensions(&input.excluded_extensions)?;
     if input.exclude_patterns.len() > 100 {
         return Err(AppError::Validation(
             "A backup can have up to 100 ignore rules".into(),
@@ -524,13 +818,73 @@ fn list_jobs(state: State<'_, AppState>) -> AppResult<Vec<SyncJob>> {
         "SELECT id, name, source_path, destination, interval_minutes,
                 backup_mode, last_full_at, enabled, last_run_at, next_run_at,
                 status, last_message, progress_percent, progress_message,
-                retention_count, exclude_patterns, created_at
+                retention_count, exclude_patterns, size_filter_mode,
+                max_file_size_mib, extension_filter_mode, excluded_extensions,
+                created_at
          FROM jobs ORDER BY created_at DESC",
     )?;
     let jobs = statement
         .query_map([], map_job)?
         .collect::<Result<Vec<_>, _>>()?;
     Ok(jobs)
+}
+
+#[tauri::command]
+fn get_app_settings(state: State<'_, AppState>) -> AppResult<AppSettings> {
+    let connection = connect(&state.db_path)?;
+    load_app_settings(&connection)
+}
+
+#[tauri::command]
+fn update_app_settings(input: AppSettings, state: State<'_, AppState>) -> AppResult<AppSettings> {
+    let mut connection = connect(&state.db_path)?;
+    update_app_settings_record(&mut connection, input)
+}
+
+fn update_app_settings_record(
+    connection: &mut Connection,
+    input: AppSettings,
+) -> AppResult<AppSettings> {
+    validate_max_file_size(input.max_file_size_mib)?;
+    let cleaned_extensions = clean_extensions(&input.excluded_extensions)?;
+    let stored_extensions = serde_json::to_string(&cleaned_extensions).map_err(|error| {
+        AppError::Validation(format!("Could not save the file extensions: {error}"))
+    })?;
+    let transaction =
+        connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let backup_running = transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM jobs WHERE status = 'running')",
+        [],
+        |row| row.get::<_, bool>(0),
+    )?;
+    if backup_running {
+        return Err(AppError::Validation(
+            "Wait for running backups to finish before changing app-wide filters".into(),
+        ));
+    }
+    let current = load_app_settings(&transaction)?;
+    let size_changed = current.max_file_size_mib != input.max_file_size_mib;
+    let extensions_changed = current.excluded_extensions != cleaned_extensions;
+    transaction.execute(
+        "UPDATE app_settings
+         SET max_file_size_mib = ?1, excluded_extensions = ?2
+         WHERE id = 1",
+        params![input.max_file_size_mib, stored_extensions],
+    )?;
+    if size_changed {
+        transaction.execute(
+            "UPDATE jobs SET last_full_at = NULL WHERE size_filter_mode = 'inherit'",
+            [],
+        )?;
+    }
+    if extensions_changed {
+        transaction.execute(
+            "UPDATE jobs SET last_full_at = NULL WHERE extension_filter_mode = 'inherit'",
+            [],
+        )?;
+    }
+    transaction.commit()?;
+    load_app_settings(connection)
 }
 
 #[tauri::command]
@@ -545,11 +899,16 @@ fn create_job(input: NewJob, state: State<'_, AppState>) -> AppResult<SyncJob> {
         &input.exclude_patterns,
     ))
     .map_err(|error| AppError::Validation(format!("Could not save the ignore rules: {error}")))?;
+    let stored_excluded_extensions =
+        serde_json::to_string(&clean_extensions(&input.excluded_extensions)?).map_err(|error| {
+            AppError::Validation(format!("Could not save the file extensions: {error}"))
+        })?;
     connection.execute(
         "INSERT INTO jobs
             (name, source_path, destination, interval_minutes, backup_mode,
-             retention_count, exclude_patterns, enabled, next_run_at, status, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 1, ?8, 'ready', ?9)",
+             retention_count, exclude_patterns, size_filter_mode, max_file_size_mib,
+             extension_filter_mode, excluded_extensions, enabled, next_run_at, status, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 1, ?12, 'ready', ?13)",
         params![
             input.name.trim(),
             stored_sources,
@@ -558,6 +917,10 @@ fn create_job(input: NewJob, state: State<'_, AppState>) -> AppResult<SyncJob> {
             input.backup_mode,
             input.retention_count,
             stored_exclude_patterns,
+            input.size_filter_mode,
+            input.max_file_size_mib,
+            input.extension_filter_mode,
+            stored_excluded_extensions,
             next_run,
             created_at
         ],
@@ -574,6 +937,11 @@ fn update_job_record(connection: &Connection, job_id: i64, input: &NewJob) -> Ap
         serde_json::to_string(&cleaned_exclude_patterns).map_err(|error| {
             AppError::Validation(format!("Could not save the ignore rules: {error}"))
         })?;
+    let cleaned_extensions = clean_extensions(&input.excluded_extensions)?;
+    let stored_excluded_extensions =
+        serde_json::to_string(&cleaned_extensions).map_err(|error| {
+            AppError::Validation(format!("Could not save the file extensions: {error}"))
+        })?;
     let next_run = if current.enabled {
         Some(add_minutes(input.interval_minutes))
     } else {
@@ -582,7 +950,11 @@ fn update_job_record(connection: &Connection, job_id: i64, input: &NewJob) -> Ap
     let baseline_still_valid = current.source_paths == input.source_paths
         && current.destination == input.destination
         && current.backup_mode == input.backup_mode
-        && current.exclude_patterns == cleaned_exclude_patterns;
+        && current.exclude_patterns == cleaned_exclude_patterns
+        && current.size_filter_mode == input.size_filter_mode
+        && current.max_file_size_mib == input.max_file_size_mib
+        && current.extension_filter_mode == input.extension_filter_mode
+        && current.excluded_extensions == cleaned_extensions;
     let last_full_at = baseline_still_valid
         .then_some(current.last_full_at)
         .flatten();
@@ -590,9 +962,11 @@ fn update_job_record(connection: &Connection, job_id: i64, input: &NewJob) -> Ap
         "UPDATE jobs
          SET name = ?1, source_path = ?2, destination = ?3,
              interval_minutes = ?4, backup_mode = ?5, last_full_at = ?6,
-             retention_count = ?7, exclude_patterns = ?8, next_run_at = ?9, status = ?10,
+             retention_count = ?7, exclude_patterns = ?8, size_filter_mode = ?9,
+             max_file_size_mib = ?10, extension_filter_mode = ?11,
+             excluded_extensions = ?12, next_run_at = ?13, status = ?14,
              progress_percent = 0, progress_message = NULL
-         WHERE id = ?11",
+         WHERE id = ?15",
         params![
             input.name.trim(),
             stored_sources,
@@ -602,6 +976,10 @@ fn update_job_record(connection: &Connection, job_id: i64, input: &NewJob) -> Ap
             last_full_at,
             input.retention_count,
             stored_exclude_patterns,
+            input.size_filter_mode,
+            input.max_file_size_mib,
+            input.extension_filter_mode,
+            stored_excluded_extensions,
             next_run,
             if current.enabled { "ready" } else { "paused" },
             job_id
@@ -992,7 +1370,46 @@ fn source_progress_message(source_name: &str, source_number: usize, source_count
     }
 }
 
-fn perform_copy(job: &SyncJob, progress: Option<&ProgressReporter>) -> AppResult<CopyOutcome> {
+fn append_filter_arguments(
+    command: &mut Command,
+    filters: &EffectiveFilters,
+    custom_patterns: &[String],
+) {
+    for pattern in custom_patterns {
+        command.arg("--exclude").arg(pattern);
+    }
+    if let Some(max_file_size_mib) = filters.max_file_size_mib {
+        command
+            .arg("--max-size")
+            .arg(format!("{max_file_size_mib}M"));
+    }
+    for extension in &filters.excluded_extensions {
+        command
+            .arg("--exclude")
+            .arg(case_insensitive_extension_pattern(extension));
+    }
+}
+
+fn case_insensitive_extension_pattern(extension: &str) -> String {
+    let mut pattern = String::from("*.");
+    for character in extension.chars() {
+        if character.is_ascii_alphabetic() {
+            pattern.push('[');
+            pattern.push(character.to_ascii_lowercase());
+            pattern.push(character.to_ascii_uppercase());
+            pattern.push(']');
+        } else {
+            pattern.push(character);
+        }
+    }
+    pattern
+}
+
+fn perform_copy_with_filters(
+    job: &SyncJob,
+    filters: &EffectiveFilters,
+    progress: Option<&ProgressReporter>,
+) -> AppResult<CopyOutcome> {
     check_cancellation(progress)?;
     let multiple_sources = job.source_paths.len() > 1;
     let source_count = job.source_paths.len();
@@ -1021,14 +1438,16 @@ fn perform_copy(job: &SyncJob, progress: Option<&ProgressReporter>) -> AppResult
         ensure_version_history(job)?;
         check_cancellation(progress)?;
     }
-    if !job.exclude_patterns.is_empty() {
+    let active_filter_count = job.exclude_patterns.len()
+        + filters.excluded_extensions.len()
+        + usize::from(filters.max_file_size_mib.is_some());
+    if active_filter_count > 0 {
         if let Some(progress) = progress {
             progress.activity(
                 "preparing",
                 &format!(
-                    "Using {} ignore rule{} to skip files that do not need backing up.",
-                    job.exclude_patterns.len(),
-                    if job.exclude_patterns.len() == 1 {
+                    "Using {active_filter_count} file filter{} to skip files that do not need backing up.",
+                    if active_filter_count == 1 {
                         ""
                     } else {
                         "s"
@@ -1088,9 +1507,7 @@ fn perform_copy(job: &SyncJob, progress: Option<&ProgressReporter>) -> AppResult
             .arg("--retries=3")
             .stdout(Stdio::null())
             .stderr(Stdio::piped());
-        for pattern in &job.exclude_patterns {
-            command.arg("--exclude").arg(pattern);
-        }
+        append_filter_arguments(&mut command, filters, &job.exclude_patterns);
         if supports_previous_files(job) {
             let snapshot = version_snapshot_destination(job, &stamp)?;
             let backup_directory = if multiple_sources {
@@ -1237,12 +1654,69 @@ fn perform_copy(job: &SyncJob, progress: Option<&ProgressReporter>) -> AppResult
     }
 }
 
+#[cfg(test)]
+fn perform_copy(job: &SyncJob, progress: Option<&ProgressReporter>) -> AppResult<CopyOutcome> {
+    let settings = AppSettings {
+        max_file_size_mib: None,
+        excluded_extensions: Vec::new(),
+    };
+    let filters = resolve_filter_values(
+        &job.size_filter_mode,
+        job.max_file_size_mib,
+        &job.extension_filter_mode,
+        &job.excluded_extensions,
+        &settings,
+    )?;
+    perform_copy_with_filters(job, &filters, progress)
+}
+
 fn child_cloud_destination(destination: &str, child_name: &str) -> String {
     if destination.ends_with(':') || destination.ends_with('/') {
         format!("{destination}{child_name}")
     } else {
         format!("{destination}/{child_name}")
     }
+}
+
+fn claim_job_for_run(
+    db_path: &Path,
+    job_id: i64,
+) -> AppResult<(SyncJob, EffectiveFilters, String)> {
+    let mut connection = connect(db_path)?;
+    let transaction =
+        connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let started_at = now_string();
+    let claimed = transaction.execute(
+        "UPDATE jobs
+         SET status = 'running', last_message = NULL,
+             progress_percent = 0, progress_message = 'Getting ready…',
+             cancel_requested = 0
+         WHERE id = ?1 AND status != 'running'",
+        [job_id],
+    )?;
+    if claimed == 0 {
+        return Err(AppError::Validation(
+            "This backup is already running in the background".into(),
+        ));
+    }
+    let job = get_job(&transaction, job_id)?;
+    let app_settings = load_app_settings(&transaction)?;
+    let effective_filters = resolve_filter_values(
+        &job.size_filter_mode,
+        job.max_file_size_mib,
+        &job.extension_filter_mode,
+        &job.excluded_extensions,
+        &app_settings,
+    )?;
+    transaction.execute("DELETE FROM backup_activity WHERE job_id = ?1", [job_id])?;
+    record_activity(
+        &transaction,
+        job_id,
+        "preparing",
+        "Backup started. Getting everything ready.",
+    )?;
+    transaction.commit()?;
+    Ok((job, effective_filters, started_at))
 }
 
 async fn execute_job(job_id: i64, state: AppState) -> AppResult<RunRecord> {
@@ -1259,30 +1733,7 @@ async fn execute_job(job_id: i64, state: AppState) -> AppResult<RunRecord> {
     }
 
     let result = async {
-        let connection = connect(&state.db_path)?;
-        let job = get_job(&connection, job_id)?;
-        let started_at = now_string();
-        let claimed = connection.execute(
-            "UPDATE jobs
-             SET status = 'running', last_message = NULL,
-                 progress_percent = 0, progress_message = 'Getting ready…',
-                 cancel_requested = 0
-             WHERE id = ?1 AND status != 'running'",
-            [job_id],
-        )?;
-        if claimed == 0 {
-            return Err(AppError::Validation(
-                "This backup is already running in the background".into(),
-            ));
-        }
-        connection.execute("DELETE FROM backup_activity WHERE job_id = ?1", [job_id])?;
-        record_activity(
-            &connection,
-            job_id,
-            "preparing",
-            "Backup started. Getting everything ready.",
-        )?;
-        drop(connection);
+        let (job, effective_filters, started_at) = claim_job_for_run(&state.db_path, job_id)?;
 
         let job_for_copy = job.clone();
         let progress = ProgressReporter {
@@ -1291,7 +1742,7 @@ async fn execute_job(job_id: i64, state: AppState) -> AppResult<RunRecord> {
         };
         let worker_progress = progress.clone();
         let copy_result = tokio::task::spawn_blocking(move || {
-            perform_copy(&job_for_copy, Some(&worker_progress))
+            perform_copy_with_filters(&job_for_copy, &effective_filters, Some(&worker_progress))
         })
         .await
         .map_err(|error| AppError::Transfer(format!("Backup worker failed: {error}")))?;
@@ -2318,6 +2769,9 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             list_jobs,
+            get_app_settings,
+            update_app_settings,
+            scan_large_files,
             create_job,
             update_job,
             set_job_enabled,
@@ -2365,6 +2819,10 @@ mod tests {
             backup_mode: "incremental".into(),
             retention_count: 5,
             exclude_patterns: Vec::new(),
+            size_filter_mode: default_filter_mode(),
+            max_file_size_mib: None,
+            extension_filter_mode: default_filter_mode(),
+            excluded_extensions: Vec::new(),
         };
         assert!(validate_new_job(&input).is_err());
     }
@@ -2379,6 +2837,10 @@ mod tests {
             backup_mode: "incremental".into(),
             retention_count: 5,
             exclude_patterns: Vec::new(),
+            size_filter_mode: default_filter_mode(),
+            max_file_size_mib: None,
+            extension_filter_mode: default_filter_mode(),
+            excluded_extensions: Vec::new(),
         };
         assert!(validate_new_job(&input).is_err());
     }
@@ -2396,6 +2858,10 @@ mod tests {
             backup_mode: "mirror".into(),
             retention_count: 5,
             exclude_patterns: Vec::new(),
+            size_filter_mode: default_filter_mode(),
+            max_file_size_mib: None,
+            extension_filter_mode: default_filter_mode(),
+            excluded_extensions: Vec::new(),
         };
         assert!(validate_new_job(&input).is_err());
         std::fs::remove_file(file_path).expect("clean up mirror file fixture");
@@ -2545,6 +3011,10 @@ mod tests {
             backup_mode: "incremental".into(),
             retention_count: 5,
             exclude_patterns: Vec::new(),
+            size_filter_mode: default_filter_mode(),
+            max_file_size_mib: None,
+            extension_filter_mode: default_filter_mode(),
+            excluded_extensions: Vec::new(),
         };
         assert!(validate_new_job(&input).is_ok());
         input.retention_count = 0;
@@ -2579,6 +3049,10 @@ mod tests {
             progress_message: None,
             retention_count: 5,
             exclude_patterns: Vec::new(),
+            size_filter_mode: default_filter_mode(),
+            max_file_size_mib: None,
+            extension_filter_mode: default_filter_mode(),
+            excluded_extensions: Vec::new(),
             created_at: now_string(),
         };
         assert_eq!(
@@ -2641,6 +3115,10 @@ mod tests {
             progress_message: None,
             retention_count: 2,
             exclude_patterns: Vec::new(),
+            size_filter_mode: default_filter_mode(),
+            max_file_size_mib: None,
+            extension_filter_mode: default_filter_mode(),
+            excluded_extensions: Vec::new(),
             created_at: now_string(),
         };
         let history_root = version_history_root(&job)
@@ -2755,6 +3233,10 @@ mod tests {
             backup_mode: "incremental".into(),
             retention_count: 7,
             exclude_patterns: vec!["target/**".into(), "**/target/**".into()],
+            size_filter_mode: "custom".into(),
+            max_file_size_mib: Some(250),
+            extension_filter_mode: "custom".into(),
+            excluded_extensions: vec!["iso".into()],
         };
         let updated =
             update_job_record(&connection, 1, &input).expect("update existing backup job");
@@ -2769,6 +3251,10 @@ mod tests {
         assert_eq!(updated.interval_minutes, 180);
         assert_eq!(updated.retention_count, 7);
         assert_eq!(updated.exclude_patterns, input.exclude_patterns);
+        assert_eq!(updated.size_filter_mode, "custom");
+        assert_eq!(updated.max_file_size_mib, Some(250));
+        assert_eq!(updated.extension_filter_mode, "custom");
+        assert_eq!(updated.excluded_extensions, vec!["iso"]);
         assert_eq!(run_count, 1);
 
         drop(connection);
@@ -2892,6 +3378,10 @@ mod tests {
                 ".git/**".into(),
                 "**/.git/**".into(),
             ],
+            size_filter_mode: default_filter_mode(),
+            max_file_size_mib: None,
+            extension_filter_mode: default_filter_mode(),
+            excluded_extensions: Vec::new(),
             created_at: now_string(),
         };
 
@@ -2990,6 +3480,10 @@ mod tests {
             progress_message: None,
             retention_count: 0,
             exclude_patterns: Vec::new(),
+            size_filter_mode: default_filter_mode(),
+            max_file_size_mib: None,
+            extension_filter_mode: default_filter_mode(),
+            excluded_extensions: Vec::new(),
             created_at: now_string(),
         };
 
@@ -3041,6 +3535,10 @@ mod tests {
             progress_message: None,
             retention_count: 0,
             exclude_patterns: Vec::new(),
+            size_filter_mode: default_filter_mode(),
+            max_file_size_mib: None,
+            extension_filter_mode: default_filter_mode(),
+            excluded_extensions: Vec::new(),
             created_at: now_string(),
         };
 
@@ -3093,6 +3591,10 @@ mod tests {
             progress_message: None,
             retention_count: 2,
             exclude_patterns: vec![".git/**".into(), "**/.git/**".into()],
+            size_filter_mode: default_filter_mode(),
+            max_file_size_mib: None,
+            extension_filter_mode: default_filter_mode(),
+            excluded_extensions: Vec::new(),
             created_at: now_string(),
         };
 
@@ -3183,6 +3685,10 @@ mod tests {
         assert!(columns.contains(&"retention_count".to_string()));
         assert!(columns.contains(&"exclude_patterns".to_string()));
         assert!(columns.contains(&"cancel_requested".to_string()));
+        assert!(columns.contains(&"size_filter_mode".to_string()));
+        assert!(columns.contains(&"max_file_size_mib".to_string()));
+        assert!(columns.contains(&"extension_filter_mode".to_string()));
+        assert!(columns.contains(&"excluded_extensions".to_string()));
         let activity_table_exists = connection
             .query_row(
                 "SELECT EXISTS(
@@ -3194,6 +3700,9 @@ mod tests {
             )
             .expect("check activity table migration");
         assert!(activity_table_exists);
+        let settings = load_app_settings(&connection).expect("load migrated app settings");
+        assert_eq!(settings.max_file_size_mib, None);
+        assert!(settings.excluded_extensions.is_empty());
 
         drop(statement);
         drop(connection);
@@ -3232,6 +3741,10 @@ mod tests {
             progress_message: None,
             retention_count: 0,
             exclude_patterns: Vec::new(),
+            size_filter_mode: default_filter_mode(),
+            max_file_size_mib: None,
+            extension_filter_mode: default_filter_mode(),
+            excluded_extensions: Vec::new(),
             created_at: now_string(),
         };
 
@@ -3302,5 +3815,220 @@ mod tests {
             "../unsafe_amd64.deb"
         )
         .is_err());
+    }
+
+    #[test]
+    fn filter_configuration_normalizes_and_validates_extensions() {
+        assert_eq!(
+            clean_extensions(&[".PDF".into(), " zip ".into()]).expect("valid extensions"),
+            vec!["pdf", "zip"]
+        );
+        assert!(clean_extensions(&["tar.gz".into()]).is_err());
+        assert!(clean_extensions(&["..zip".into()]).is_err());
+        assert!(clean_extensions(&["pdf".into(), ".PDF".into()]).is_err());
+        assert!(validate_max_file_size(Some(0)).is_err());
+        assert!(validate_max_file_size(Some(100)).is_ok());
+    }
+
+    #[test]
+    fn filter_configuration_resolves_inherit_custom_and_disabled_modes() {
+        let settings = AppSettings {
+            max_file_size_mib: Some(100),
+            excluded_extensions: vec!["zip".into()],
+        };
+
+        assert_eq!(
+            resolve_filter_values("inherit", None, "inherit", &[], &settings).expect("inherit"),
+            EffectiveFilters {
+                max_file_size_mib: Some(100),
+                excluded_extensions: vec!["zip".into()],
+            }
+        );
+        assert_eq!(
+            resolve_filter_values("custom", Some(50), "custom", &["iso".into()], &settings)
+                .expect("custom"),
+            EffectiveFilters {
+                max_file_size_mib: Some(50),
+                excluded_extensions: vec!["iso".into()],
+            }
+        );
+        assert_eq!(
+            resolve_filter_values("disabled", Some(50), "disabled", &["iso".into()], &settings)
+                .expect("disabled"),
+            EffectiveFilters {
+                max_file_size_mib: None,
+                excluded_extensions: Vec::new(),
+            }
+        );
+        assert!(resolve_filter_values("unknown", None, "inherit", &[], &settings).is_err());
+    }
+
+    #[test]
+    fn large_file_scan_counts_only_files_over_threshold_without_following_symlinks() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock should be after the Unix epoch")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "cloudfolder-large-scan-{}-{unique}",
+            std::process::id()
+        ));
+        let nested = root.join("nested");
+        std::fs::create_dir_all(&nested).expect("create scan fixture");
+        let threshold = 25 * 1024 * 1024;
+        std::fs::File::create(root.join("exact.bin"))
+            .expect("create exact file")
+            .set_len(threshold)
+            .expect("size exact file");
+        std::fs::File::create(root.join("large.bin"))
+            .expect("create large file")
+            .set_len(threshold + 1)
+            .expect("size large file");
+        std::fs::File::create(nested.join("largest.iso"))
+            .expect("create largest file")
+            .set_len(threshold + 1024)
+            .expect("size largest file");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&nested, root.join("nested-link"))
+            .expect("create directory symlink");
+
+        let result = scan_paths_for_large_files(
+            &[
+                root.to_string_lossy().into_owned(),
+                nested.to_string_lossy().into_owned(),
+            ],
+            threshold,
+        )
+        .expect("scan source paths");
+
+        assert_eq!(result.threshold_bytes, threshold);
+        assert_eq!(result.matching_file_count, 2);
+        assert_eq!(result.examples.len(), 2);
+        assert!(result.examples[0].size_bytes > result.examples[1].size_bytes);
+        assert!(result.examples[0].path.ends_with("largest.iso"));
+        assert_eq!(result.unreadable_path_count, 0);
+
+        std::fs::remove_dir_all(root).expect("clean up scan fixture");
+    }
+
+    #[test]
+    fn rclone_filter_arguments_include_size_extensions_and_existing_rules() {
+        let mut command = Command::new("rclone");
+        append_filter_arguments(
+            &mut command,
+            &EffectiveFilters {
+                max_file_size_mib: Some(100),
+                excluded_extensions: vec!["zip".into(), "pdf".into()],
+            },
+            &["**/.git/**".into()],
+        );
+        let arguments = command
+            .get_args()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+
+        assert!(arguments
+            .windows(2)
+            .any(|pair| pair == ["--max-size", "100M"]));
+        assert!(arguments
+            .windows(2)
+            .any(|pair| pair == ["--exclude", "*.[zZ][iI][pP]"]));
+        assert!(arguments
+            .windows(2)
+            .any(|pair| pair == ["--exclude", "*.[pP][dD][fF]"]));
+        assert!(arguments
+            .windows(2)
+            .any(|pair| pair == ["--exclude", "**/.git/**"]));
+        assert!(!arguments.iter().any(|argument| argument == "--ignore-case"));
+    }
+
+    #[test]
+    fn global_filter_update_invalidates_only_inheriting_baselines() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock should be after the Unix epoch")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "cloudfolder-filter-settings-{}-{unique}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).expect("create settings fixture");
+        let database_path = root.join("settings.sqlite3");
+        initialize_database(&database_path).expect("initialize settings database");
+        let mut connection = connect(&database_path).expect("open settings database");
+        connection
+            .execute(
+                "INSERT INTO jobs
+                    (id, name, source_path, destination, interval_minutes, last_full_at,
+                     size_filter_mode, extension_filter_mode, created_at)
+                 VALUES
+                    (1, 'Inherited', '/tmp/source-one', 'drive:one', 60, 'baseline',
+                     'inherit', 'inherit', 'now'),
+                    (2, 'Disabled', '/tmp/source-two', 'drive:two', 60, 'baseline',
+                     'disabled', 'disabled', 'now')",
+                [],
+            )
+            .expect("insert settings jobs");
+
+        update_app_settings_record(
+            &mut connection,
+            AppSettings {
+                max_file_size_mib: Some(100),
+                excluded_extensions: vec!["iso".into()],
+            },
+        )
+        .expect("update app settings");
+
+        let inherited_baseline: Option<String> = connection
+            .query_row("SELECT last_full_at FROM jobs WHERE id = 1", [], |row| {
+                row.get(0)
+            })
+            .expect("read inherited baseline");
+        let disabled_baseline: Option<String> = connection
+            .query_row("SELECT last_full_at FROM jobs WHERE id = 2", [], |row| {
+                row.get(0)
+            })
+            .expect("read disabled baseline");
+        assert_eq!(inherited_baseline, None);
+        assert_eq!(disabled_baseline.as_deref(), Some("baseline"));
+
+        drop(connection);
+        std::fs::remove_dir_all(root).expect("clean up settings fixture");
+    }
+
+    #[test]
+    fn global_filter_update_is_rejected_while_a_backup_is_running() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock should be after the Unix epoch")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "cloudfolder-running-settings-{}-{unique}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).expect("create running settings fixture");
+        let database_path = root.join("settings.sqlite3");
+        initialize_database(&database_path).expect("initialize settings database");
+        let mut connection = connect(&database_path).expect("open settings database");
+        connection
+            .execute(
+                "INSERT INTO jobs
+                    (name, source_path, destination, interval_minutes, status, created_at)
+                 VALUES ('Running', '/tmp/source', 'drive:backup', 60, 'running', 'now')",
+                [],
+            )
+            .expect("insert running job");
+
+        let result = update_app_settings_record(
+            &mut connection,
+            AppSettings {
+                max_file_size_mib: Some(100),
+                excluded_extensions: vec!["iso".into()],
+            },
+        );
+        assert!(matches!(result, Err(AppError::Validation(_))));
+
+        drop(connection);
+        std::fs::remove_dir_all(root).expect("clean up running settings fixture");
     }
 }

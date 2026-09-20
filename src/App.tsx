@@ -199,6 +199,12 @@ const developerExcludePatterns: string[] = [
   "**/node_modules/**",
   ".git/**",
   "**/.git/**",
+  "**/pfx/**",
+  "**/drive_c/**",
+  "**/.venv/**",
+  "**/venv/**",
+  "**/__pycache__/**",
+  "**/.cache/**",
 ];
 
 interface CloudFolderEntry {

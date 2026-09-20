@@ -313,12 +313,23 @@ fn initialize_database(path: &Path) -> AppResult<()> {
             message     TEXT NOT NULL
         );
 
+        CREATE TABLE IF NOT EXISTS file_cache (
+            job_id       INTEGER NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+            source_index INTEGER NOT NULL,
+            relative_path TEXT NOT NULL,
+            mtime_ns     INTEGER NOT NULL,
+            size_bytes   INTEGER NOT NULL,
+            PRIMARY KEY (job_id, source_index, relative_path)
+        );
+
         CREATE INDEX IF NOT EXISTS idx_jobs_due
             ON jobs(enabled, next_run_at);
         CREATE INDEX IF NOT EXISTS idx_runs_job
             ON runs(job_id, id DESC);
         CREATE INDEX IF NOT EXISTS idx_backup_activity_job
             ON backup_activity(job_id, id DESC);
+        CREATE INDEX IF NOT EXISTS idx_file_cache_job
+            ON file_cache(job_id, source_index);
         ",
     )?;
     ensure_job_column(
@@ -876,10 +887,18 @@ fn update_app_settings_record(
             "UPDATE jobs SET last_full_at = NULL WHERE size_filter_mode = 'inherit'",
             [],
         )?;
+        transaction.execute(
+            "DELETE FROM file_cache WHERE job_id IN (SELECT id FROM jobs WHERE size_filter_mode = 'inherit')",
+            [],
+        )?;
     }
     if extensions_changed {
         transaction.execute(
             "UPDATE jobs SET last_full_at = NULL WHERE extension_filter_mode = 'inherit'",
+            [],
+        )?;
+        transaction.execute(
+            "DELETE FROM file_cache WHERE job_id IN (SELECT id FROM jobs WHERE extension_filter_mode = 'inherit')",
             [],
         )?;
     }
@@ -985,6 +1004,9 @@ fn update_job_record(connection: &Connection, job_id: i64, input: &NewJob) -> Ap
             job_id
         ],
     )?;
+    if !baseline_still_valid {
+        connection.execute("DELETE FROM file_cache WHERE job_id = ?1", [job_id])?;
+    }
     get_job(connection, job_id)
 }
 
@@ -1203,6 +1225,7 @@ fn version_snapshots_for_job(job: &SyncJob) -> AppResult<Vec<VersionSnapshot>> {
         .arg("lsjson")
         .arg(version_history_root(job)?)
         .arg("--dirs-only")
+        .arg("--fast-list")
         .arg("--no-modtime")
         .arg("--no-mimetype")
         .output()
@@ -1243,6 +1266,8 @@ fn prune_version_history(job: &SyncJob) -> AppResult<()> {
         let output = Command::new("rclone")
             .arg("purge")
             .arg(version_snapshot_destination(job, &snapshot.name)?)
+            .arg("--drive-use-trash=false")
+            .arg("--fast-list")
             .output()
             .map_err(|error| {
                 AppError::Transfer(format!(
@@ -1405,6 +1430,301 @@ fn case_insensitive_extension_pattern(extension: &str) -> String {
     pattern
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LocalFileEntry {
+    relative_path: String,
+    mtime_ns: i64,
+    size_bytes: i64,
+}
+
+#[derive(Debug, Clone)]
+struct SourceScanResult {
+    changed_files: Vec<String>,
+    scanned_entries: Vec<LocalFileEntry>,
+    has_cache: bool,
+}
+
+fn matches_exclude_pattern(relative_path: &str, pattern: &str, is_dir: bool) -> bool {
+    let rel_norm = relative_path.replace('\\', "/");
+    let pat_norm = pattern.replace('\\', "/");
+    let rel = rel_norm.trim_start_matches('/');
+    let pat = pat_norm.trim();
+
+    if pat.is_empty() {
+        return false;
+    }
+
+    if rel == pat || (is_dir && format!("{rel}/") == pat) {
+        return true;
+    }
+
+    if let Some(target) = pat.strip_prefix("**/") {
+        let clean_target = target
+            .trim_end_matches("/**")
+            .trim_end_matches("/*")
+            .trim_end_matches('/');
+        for segment in rel.split('/') {
+            if segment.eq_ignore_ascii_case(clean_target) {
+                return true;
+            }
+        }
+        if rel.starts_with(clean_target)
+            || rel.contains(&format!("/{clean_target}/"))
+            || rel.ends_with(&format!("/{clean_target}"))
+        {
+            return true;
+        }
+    }
+
+    if let Some(prefix) = pat.strip_suffix("/**").or_else(|| pat.strip_suffix("/*")) {
+        if rel == prefix || rel.starts_with(&format!("{prefix}/")) {
+            return true;
+        }
+    }
+
+    if pat.starts_with("*.") {
+        let ext = &pat[2..];
+        if let Some(file_ext) = Path::new(rel).extension().and_then(|s| s.to_str()) {
+            if file_ext.eq_ignore_ascii_case(ext) {
+                return true;
+            }
+        }
+    }
+
+    if pat.contains('*') {
+        let parts: Vec<&str> = pat.split('*').filter(|s| !s.is_empty()).collect();
+        if parts.is_empty() {
+            return true;
+        }
+        let mut search_in = rel;
+        let mut all_found = true;
+        for (i, part) in parts.iter().enumerate() {
+            if i == 0 && !pat.starts_with('*') {
+                if !search_in.starts_with(part) {
+                    all_found = false;
+                    break;
+                }
+                search_in = &search_in[part.len()..];
+            } else if let Some(idx) = search_in.find(part) {
+                search_in = &search_in[idx + part.len()..];
+            } else {
+                all_found = false;
+                break;
+            }
+        }
+        if all_found && (pat.ends_with('*') || search_in.is_empty()) {
+            return true;
+        }
+    }
+
+    false
+}
+
+fn is_path_excluded(
+    relative_path: &str,
+    is_dir: bool,
+    exclude_patterns: &[String],
+    filters: &EffectiveFilters,
+    file_size_bytes: Option<u64>,
+) -> bool {
+    let rel = relative_path.trim_start_matches('/');
+
+    if !is_dir {
+        if let (Some(max_mb), Some(size)) = (filters.max_file_size_mib, file_size_bytes) {
+            if size > (max_mb as u64) * 1024 * 1024 {
+                return true;
+            }
+        }
+
+        if let Some(ext) = Path::new(rel).extension().and_then(|s| s.to_str()) {
+            if filters
+                .excluded_extensions
+                .iter()
+                .any(|e| e.eq_ignore_ascii_case(ext))
+            {
+                return true;
+            }
+        }
+    }
+
+    for pattern in exclude_patterns {
+        if matches_exclude_pattern(rel, pattern, is_dir) {
+            return true;
+        }
+    }
+
+    false
+}
+
+fn scan_source_with_cache(
+    source_root: &Path,
+    job_id: i64,
+    source_index: usize,
+    db_path: Option<&Path>,
+    filters: &EffectiveFilters,
+    exclude_patterns: &[String],
+) -> AppResult<SourceScanResult> {
+    let mut cached_map: HashMap<String, (i64, i64)> = HashMap::new();
+    let mut has_cache = false;
+
+    if let Some(db_path) = db_path {
+        if let Ok(conn) = connect(db_path) {
+            if let Ok(mut stmt) = conn.prepare(
+                "SELECT relative_path, mtime_ns, size_bytes FROM file_cache WHERE job_id = ?1 AND source_index = ?2",
+            ) {
+                if let Ok(rows) = stmt.query_map(params![job_id, source_index as i64], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        (row.get::<_, i64>(1)?, row.get::<_, i64>(2)?),
+                    ))
+                }) {
+                    for row in rows.flatten() {
+                        cached_map.insert(row.0, row.1);
+                    }
+                    has_cache = !cached_map.is_empty();
+                }
+            }
+        }
+    }
+
+    let mut scanned_entries = Vec::new();
+    let mut changed_files = Vec::new();
+
+    if source_root.is_file() {
+        let file_name = source_root
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "file".into());
+        if let Ok(metadata) = source_root.symlink_metadata() {
+            if !metadata.file_type().is_symlink() {
+                let size = metadata.len() as i64;
+                let mtime = metadata
+                    .modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_nanos() as i64)
+                    .unwrap_or(0);
+                let entry = LocalFileEntry {
+                    relative_path: file_name.clone(),
+                    mtime_ns: mtime,
+                    size_bytes: size,
+                };
+                let is_changed = match cached_map.get(&file_name) {
+                    Some(&(c_mtime, c_size)) => c_mtime != mtime || c_size != size,
+                    None => true,
+                };
+                if is_changed {
+                    changed_files.push(file_name);
+                }
+                scanned_entries.push(entry);
+            }
+        }
+        return Ok(SourceScanResult {
+            changed_files,
+            scanned_entries,
+            has_cache,
+        });
+    }
+
+    let mut stack = vec![source_root.to_path_buf()];
+    while let Some(current_dir) = stack.pop() {
+        let entries = match std::fs::read_dir(&current_dir) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let metadata = match path.symlink_metadata() {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+
+            let file_type = metadata.file_type();
+            if file_type.is_symlink() {
+                continue;
+            }
+
+            let rel_path = match path.strip_prefix(source_root) {
+                Ok(rel) => rel.to_string_lossy().replace('\\', "/"),
+                Err(_) => continue,
+            };
+
+            if file_type.is_dir() {
+                if is_path_excluded(&rel_path, true, exclude_patterns, filters, None) {
+                    continue;
+                }
+                stack.push(path);
+            } else if file_type.is_file() {
+                let size = metadata.len() as i64;
+                if is_path_excluded(&rel_path, false, exclude_patterns, filters, Some(size as u64)) {
+                    continue;
+                }
+
+                let mtime = metadata
+                    .modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_nanos() as i64)
+                    .unwrap_or(0);
+
+                let entry = LocalFileEntry {
+                    relative_path: rel_path.clone(),
+                    mtime_ns: mtime,
+                    size_bytes: size,
+                };
+
+                let is_changed = match cached_map.get(&rel_path) {
+                    Some(&(c_mtime, c_size)) => c_mtime != mtime || c_size != size,
+                    None => true,
+                };
+
+                if is_changed {
+                    changed_files.push(rel_path);
+                }
+                scanned_entries.push(entry);
+            }
+        }
+    }
+
+    Ok(SourceScanResult {
+        changed_files,
+        scanned_entries,
+        has_cache,
+    })
+}
+
+fn commit_file_cache(
+    db_path: &Path,
+    job_id: i64,
+    source_index: usize,
+    entries: &[LocalFileEntry],
+) -> AppResult<()> {
+    let mut conn = connect(db_path)?;
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    tx.execute(
+        "DELETE FROM file_cache WHERE job_id = ?1 AND source_index = ?2",
+        params![job_id, source_index as i64],
+    )?;
+    {
+        let mut stmt = tx.prepare(
+            "INSERT INTO file_cache (job_id, source_index, relative_path, mtime_ns, size_bytes)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+        )?;
+        for entry in entries {
+            stmt.execute(params![
+                job_id,
+                source_index as i64,
+                entry.relative_path,
+                entry.mtime_ns,
+                entry.size_bytes
+            ])?;
+        }
+    }
+    tx.commit()?;
+    Ok(())
+}
+
 fn perform_copy_with_filters(
     job: &SyncJob,
     filters: &EffectiveFilters,
@@ -1490,6 +1810,62 @@ fn perform_copy_with_filters(
         } else {
             mode_destination.clone()
         };
+
+        let db_path = progress.map(|p| p.db_path.as_path());
+        let use_fast_cache = job.backup_mode == "incremental" && db_path.is_some();
+        let scan_result = if use_fast_cache {
+            Some(scan_source_with_cache(
+                source,
+                job.id,
+                source_index,
+                db_path,
+                filters,
+                &job.exclude_patterns,
+            )?)
+        } else {
+            None
+        };
+
+        let mut manifest_path_to_clean: Option<PathBuf> = None;
+
+        if let Some(ref scan) = scan_result {
+            if scan.has_cache && scan.changed_files.is_empty() {
+                if let Some(progress) = progress {
+                    let completed_percent =
+                        (((source_index + 1) * 100) / source_count.max(1)) as i64;
+                    progress.report(completed_percent.min(99), &progress_message);
+                    progress.activity(
+                        "success",
+                        &format!("{source_name}: Up to date (0 files modified)."),
+                    );
+                }
+                completed.push(format!("{source_name} → {destination}: Up to date (0 files modified)"));
+                continue;
+            }
+
+            if scan.has_cache && !scan.changed_files.is_empty() {
+                if let Some(progress) = progress {
+                    progress.activity(
+                        "preparing",
+                        &format!(
+                            "{source_name}: Found {} modified file{} to back up.",
+                            scan.changed_files.len(),
+                            if scan.changed_files.len() == 1 { "" } else { "s" }
+                        ),
+                    );
+                }
+                let temp_manifest = std::env::temp_dir().join(format!(
+                    "cloudfolder_manifest_{}_{}_{}.txt",
+                    job.id,
+                    source_index,
+                    std::process::id()
+                ));
+                if std::fs::write(&temp_manifest, scan.changed_files.join("\n")).is_ok() {
+                    manifest_path_to_clean = Some(temp_manifest);
+                }
+            }
+        }
+
         let mut command = Command::new("rclone");
         command
             .arg(if job.backup_mode == "mirror" {
@@ -1505,8 +1881,21 @@ fn perform_copy_with_filters(
             .arg("--stats-log-level=NOTICE")
             .arg("--log-level=INFO")
             .arg("--retries=3")
+            .arg("--transfers=8")
+            .arg("--checkers=16")
+            .arg("--fast-list")
+            .arg("--drive-chunk-size=64M")
+            .arg("--drive-pacer-min-sleep=10ms")
+            .arg("--drive-pacer-burst=200")
+            .arg("--drive-use-trash=false")
+            .arg("--skip-links")
+            .arg("--use-mmap")
+            .arg("--buffer-size=32M")
             .stdout(Stdio::null())
             .stderr(Stdio::piped());
+        if let Some(ref temp_manifest) = manifest_path_to_clean {
+            command.arg("--files-from-raw").arg(temp_manifest);
+        }
         append_filter_arguments(&mut command, filters, &job.exclude_patterns);
         if supports_previous_files(job) {
             let snapshot = version_snapshot_destination(job, &stamp)?;
@@ -1530,6 +1919,9 @@ fn perform_copy_with_filters(
         }
         check_cancellation(progress)?;
         let mut child = command.spawn().map_err(|error| {
+            if let Some(ref path) = manifest_path_to_clean {
+                let _ = std::fs::remove_file(path);
+            }
             AppError::Transfer(format!(
                 "Could not start rclone: {error}. Install rclone and try again."
             ))
@@ -1541,6 +1933,9 @@ fn perform_copy_with_filters(
             );
         }
         let stderr = child.stderr.take().ok_or_else(|| {
+            if let Some(ref path) = manifest_path_to_clean {
+                let _ = std::fs::remove_file(path);
+            }
             AppError::Transfer("CloudFolder could not read rclone progress".into())
         })?;
         let mut messages = Vec::new();
@@ -1581,6 +1976,9 @@ fn perform_copy_with_filters(
                 }
             }
             if progress.is_some_and(ProgressReporter::cancellation_requested) {
+                if let Some(ref path) = manifest_path_to_clean {
+                    let _ = std::fs::remove_file(path);
+                }
                 if let Some(progress) = progress {
                     progress.activity("cancelled", "Stopping the active cloud transfer safely.");
                 }
@@ -1590,12 +1988,21 @@ fn perform_copy_with_filters(
             }
         }
         if progress.is_some_and(ProgressReporter::cancellation_requested) {
+            if let Some(ref path) = manifest_path_to_clean {
+                let _ = std::fs::remove_file(path);
+            }
             let _ = child.kill();
             let _ = child.wait();
             return Err(cancelled_error());
         }
         let status = child.wait()?;
+        if let Some(ref path) = manifest_path_to_clean {
+            let _ = std::fs::remove_file(path);
+        }
         if status.success() {
+            if let (Some(db_path), Some(scan)) = (db_path, scan_result) {
+                let _ = commit_file_cache(db_path, job.id, source_index, &scan.scanned_entries);
+            }
             if let Some(progress) = progress {
                 let completed_percent = (((source_index + 1) * 100) / source_count.max(1)) as i64;
                 progress.report(completed_percent.min(99), &progress_message);
@@ -1931,6 +2338,11 @@ fn restore_version_file_for_job(
         .arg("copyto")
         .arg(remote_file)
         .arg(&restored_path)
+        .arg("--drive-chunk-size=64M")
+        .arg("--drive-pacer-min-sleep=10ms")
+        .arg("--drive-pacer-burst=200")
+        .arg("--use-mmap")
+        .arg("--buffer-size=32M")
         .output()
         .map_err(|error| {
             AppError::Transfer(format!("Could not start restoring the file: {error}"))
@@ -2121,6 +2533,7 @@ fn list_cloud_folders(remote: String, path: String) -> AppResult<Vec<CloudFolder
         .arg("lsjson")
         .arg(destination)
         .arg("--dirs-only")
+        .arg("--fast-list")
         .arg("--no-modtime")
         .arg("--no-mimetype")
         .output()
@@ -4030,5 +4443,71 @@ mod tests {
 
         drop(connection);
         std::fs::remove_dir_all(root).expect("clean up running settings fixture");
+    }
+
+    #[test]
+    fn exclude_patterns_match_folders_extensions_and_globs() {
+        assert!(matches_exclude_pattern("target/debug/app", "target/**", false));
+        assert!(matches_exclude_pattern("src/target/file.txt", "**/target/**", false));
+        assert!(matches_exclude_pattern("dune/pfx/drive_c/windows", "**/pfx/**", true));
+        assert!(matches_exclude_pattern("app.pyc", "*.pyc", false));
+        assert!(matches_exclude_pattern("node_modules", "node_modules/**", true));
+        assert!(!matches_exclude_pattern("src/main.rs", "target/**", false));
+    }
+
+    #[test]
+    fn local_metadata_cache_detects_deltas_and_skips_unchanged() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("cloudfolder-cache-test-{}-{unique}", std::process::id()));
+        let source = root.join("source");
+        std::fs::create_dir_all(&source).expect("create source dir");
+        let file1 = source.join("file1.txt");
+        let file2 = source.join("file2.txt");
+        std::fs::write(&file1, b"hello 1").expect("write file1");
+        std::fs::write(&file2, b"hello 2").expect("write file2");
+
+        let db_path = root.join("test.sqlite3");
+        initialize_database(&db_path).expect("init db");
+        let connection = connect(&db_path).expect("open test database");
+        connection
+            .execute(
+                "INSERT INTO jobs (id, name, source_path, destination, interval_minutes, created_at)
+                 VALUES (1, 'Test', '/tmp/source', 'drive:backup', 60, 'now')",
+                [],
+            )
+            .expect("insert test job");
+        drop(connection);
+
+        let filters = EffectiveFilters {
+            max_file_size_mib: None,
+            excluded_extensions: Vec::new(),
+        };
+
+        // 1. First scan on empty cache
+        let scan1 = scan_source_with_cache(&source, 1, 0, Some(&db_path), &filters, &[]).expect("scan1");
+        assert_eq!(scan1.has_cache, false);
+        assert_eq!(scan1.changed_files.len(), 2);
+        assert_eq!(scan1.scanned_entries.len(), 2);
+
+        // Commit cache
+        commit_file_cache(&db_path, 1, 0, &scan1.scanned_entries).expect("commit");
+
+        // 2. Second scan on unmodified files -> 0 changed files
+        let scan2 = scan_source_with_cache(&source, 1, 0, Some(&db_path), &filters, &[]).expect("scan2");
+        assert_eq!(scan2.has_cache, true);
+        assert_eq!(scan2.changed_files.len(), 0);
+
+        // 3. Modify one file -> exactly 1 changed file
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        std::fs::write(&file1, b"hello modified").expect("modify file1");
+
+        let scan3 = scan_source_with_cache(&source, 1, 0, Some(&db_path), &filters, &[]).expect("scan3");
+        assert_eq!(scan3.has_cache, true);
+        assert_eq!(scan3.changed_files, vec!["file1.txt".to_string()]);
+
+        std::fs::remove_dir_all(root).expect("clean up");
     }
 }

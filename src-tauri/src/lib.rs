@@ -1338,6 +1338,14 @@ fn check_cancellation(progress: Option<&ProgressReporter>) -> AppResult<()> {
     }
 }
 
+fn is_rclone_heartbeat_stats_line(line: &str) -> bool {
+    let lower = line.to_lowercase();
+    let is_zero_stats = (lower.contains("0 b / 0 b") || lower.contains("0b / 0b") || lower.contains("0 b/s, eta -"))
+        && !lower.contains("error")
+        && !lower.contains("failed");
+    is_zero_stats
+}
+
 fn rclone_progress_percent(line: &str) -> Option<i64> {
     line.split(',').find_map(|part| {
         part.trim()
@@ -1959,11 +1967,16 @@ fn perform_copy_with_filters(
             AppError::Transfer("CloudFolder could not read rclone progress".into())
         })?;
         let mut messages = Vec::new();
+        let mut last_logged_percent: Option<i64> = None;
+        let mut last_progress_log_time = std::time::Instant::now();
+
         for line in BufReader::new(stderr).lines() {
             match line {
                 Ok(line) => {
                     let source_percent = rclone_progress_percent(&line);
                     let clean_line = clean_rclone_log_line(&line);
+                    let is_heartbeat = is_rclone_heartbeat_stats_line(&line);
+
                     if let Some(source_percent) = source_percent {
                         let overall_percent = (((source_index as f64
                             + source_percent as f64 / 100.0)
@@ -1972,17 +1985,25 @@ fn perform_copy_with_filters(
                             .round() as i64;
                         if let Some(progress) = progress {
                             progress.report(overall_percent.min(99), &progress_message);
-                            progress.activity(
-                                activity_state_for_line(&line, true),
-                                &format!("{source_name}: {clean_line}"),
-                            );
+                            let is_milestone = last_logged_percent.map_or(true, |prev| (source_percent - prev).abs() >= 10);
+                            let time_elapsed = last_progress_log_time.elapsed() >= std::time::Duration::from_secs(12);
+                            if !is_heartbeat && (is_milestone || time_elapsed) {
+                                last_logged_percent = Some(source_percent);
+                                last_progress_log_time = std::time::Instant::now();
+                                progress.activity(
+                                    activity_state_for_line(&line, true),
+                                    &format!("{source_name}: {clean_line}"),
+                                );
+                            }
                         }
                     } else if !line.trim().is_empty() {
-                        if let Some(progress) = progress {
-                            progress.activity(
-                                activity_state_for_line(&line, false),
-                                &format!("{source_name}: {clean_line}"),
-                            );
+                        if !is_heartbeat {
+                            if let Some(progress) = progress {
+                                progress.activity(
+                                    activity_state_for_line(&line, false),
+                                    &format!("{source_name}: {clean_line}"),
+                                );
+                            }
                         }
                         messages.push(line);
                     }
@@ -3378,6 +3399,13 @@ mod tests {
             source_progress_message("Documents", 1, 1),
             "Copying Documents"
         );
+    }
+
+    #[test]
+    fn heartbeat_stats_lines_are_detected() {
+        assert!(is_rclone_heartbeat_stats_line("2026/09/22 16:14:44 NOTICE: 0 B / 0 B, -, 0 B/s, ETA -"));
+        assert!(is_rclone_heartbeat_stats_line("0 B / 0 B, -, 0 B/s, ETA -"));
+        assert!(!is_rclone_heartbeat_stats_line("12 MiB / 100 MiB, 12%, 4 MiB/s, ETA 22s"));
     }
 
     #[test]

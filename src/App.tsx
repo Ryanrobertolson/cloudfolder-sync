@@ -228,6 +228,15 @@ const initialDraft: JobDraft = {
   excluded_extensions: [],
 };
 
+function isSpamHeartbeat(entry: ActivityLogEntry): boolean {
+  const msg = entry.message.toLowerCase();
+  return (
+    (msg.includes("0 b / 0 b") || msg.includes("0b / 0b") || msg.includes("0 b/s, eta -")) &&
+    !msg.includes("error") &&
+    !msg.includes("failed")
+  );
+}
+
 function formatTime(value: string | null): string {
   if (!value) return "Not yet";
   return new Intl.DateTimeFormat(undefined, {
@@ -334,6 +343,8 @@ export default function App() {
     useState<CloudSetupStatus>("picker");
   const [cloudSetupMessage, setCloudSetupMessage] = useState<string | null>(null);
   const [showGdriveModal, setShowGdriveModal] = useState(false);
+  const [expandedLogJobId, setExpandedLogJobId] = useState<number | null>(null);
+  const [inlineLogs, setInlineLogs] = useState<Record<number, ActivityLogEntry[]>>({});
   const [gdriveClientId, setGdriveClientId] = useState("");
   const [gdriveClientSecret, setGdriveClientSecret] = useState("");
   const [gdriveRootFolderId, setGdriveRootFolderId] = useState("");
@@ -515,6 +526,21 @@ export default function App() {
     );
     return () => window.clearInterval(timer);
   }, [hasRunningJob, refreshJobs]);
+
+  useEffect(() => {
+    if (!expandedLogJobId) return;
+    const fetchInline = async () => {
+      try {
+        const entries = (await invoke<ActivityLogEntry[]>("job_activity", { jobId: expandedLogJobId })) ?? [];
+        setInlineLogs((curr) => ({ ...curr, [expandedLogJobId]: entries }));
+      } catch {
+        // ignore inline poll errors
+      }
+    };
+    void fetchInline();
+    const interval = window.setInterval(() => void fetchInline(), 1200);
+    return () => window.clearInterval(interval);
+  }, [expandedLogJobId]);
 
   useEffect(() => {
     setCancellingIds((current) => {
@@ -1638,19 +1664,30 @@ export default function App() {
                       {isRunning ? (
                         <div className="running-job-controls">
                           <div
-                            className="backup-progress"
+                            className="backup-progress clickable-progress"
                             role="progressbar"
                             aria-label={`Backing up ${job.name}`}
                             aria-valuemin={0}
                             aria-valuemax={100}
                             aria-valuenow={progressPercent}
+                            onClick={() =>
+                              setExpandedLogJobId((curr) =>
+                                curr === job.id ? null : job.id,
+                              )
+                            }
+                            title="Click to expand/collapse live transfer log"
                           >
                             <div className="backup-progress-copy">
                               <small>
                                 {job.progress_message ??
                                   `Backing up ${job.name}`}
                               </small>
-                              <strong>{progressPercent}%</strong>
+                              <div style={{ display: "flex", alignItems: "center", gap: "6px" }}>
+                                <strong>{progressPercent}%</strong>
+                                <span className="progress-expand-hint">
+                                  {expandedLogJobId === job.id ? "▲ Hide" : "▼ Live Log"}
+                                </span>
+                              </div>
                             </div>
                             <div className="backup-progress-track">
                               <span
@@ -1663,7 +1700,7 @@ export default function App() {
                               className="activity-link"
                               onClick={() => void openActivityLog(job)}
                             >
-                              View activity
+                              Full log
                             </button>
                             <button
                               className="cancel-sync-link"
@@ -1672,9 +1709,34 @@ export default function App() {
                             >
                               {cancellingIds.has(job.id)
                                 ? "Stopping…"
-                                : "Cancel backup"}
+                                : "Cancel"}
                             </button>
                           </div>
+                          {expandedLogJobId === job.id && (
+                            <div className="inline-log-drawer">
+                              <div className="inline-log-header">
+                                <span>Live Activity Feed</span>
+                                <small>Auto-scrolling</small>
+                              </div>
+                              <div className="inline-log-body">
+                                {((inlineLogs[job.id] ?? []).filter((e) => !isSpamHeartbeat(e)).length === 0) ? (
+                                  <div className="inline-log-empty">Waiting for transfer events…</div>
+                                ) : (
+                                  (inlineLogs[job.id] ?? [])
+                                    .filter((e) => !isSpamHeartbeat(e))
+                                    .slice(-12)
+                                    .map((entry) => (
+                                      <div className="inline-log-row" key={entry.id}>
+                                        <span className={`log-tag log-tag-${entry.state}`}>
+                                          {entry.state}
+                                        </span>
+                                        <span className="log-text">{entry.message}</span>
+                                      </div>
+                                    ))
+                                )}
+                              </div>
+                            </div>
+                          )}
                         </div>
                       ) : (
                         <button
@@ -3660,7 +3722,7 @@ export default function App() {
                   <p>Start this backup and its messages will show up here.</p>
                 </div>
               ) : (
-                activityEntries.map((entry) => (
+                activityEntries.filter((e) => !isSpamHeartbeat(e)).map((entry) => (
                   <article
                     className={`activity-entry ${entry.state}`}
                     key={entry.id}

@@ -1866,6 +1866,10 @@ fn perform_copy_with_filters(
             }
         }
 
+        let is_google_drive = destination.starts_with("CloudFolder:")
+            || destination.starts_with("gdrive:")
+            || destination.to_lowercase().contains("drive:");
+
         let mut command = Command::new("rclone");
         command
             .arg(if job.backup_mode == "mirror" {
@@ -1881,14 +1885,32 @@ fn perform_copy_with_filters(
             .arg("--stats-log-level=NOTICE")
             .arg("--log-level=INFO")
             .arg("--retries=3")
-            .arg("--transfers=8")
-            .arg("--checkers=16")
             .arg("--fast-list")
-            .arg("--drive-chunk-size=64M")
-            .arg("--drive-use-trash=false")
             .arg("--skip-links")
-            .arg("--use-mmap")
-            .arg("--buffer-size=32M")
+            .arg("--use-mmap");
+
+        if is_google_drive {
+            command
+                .arg("--transfers=6")
+                .arg("--checkers=8")
+                .arg("--tpslimit=10")
+                .arg("--tpslimit-burst=15")
+                .arg("--drive-pacer-min-sleep=100ms")
+                .arg("--drive-pacer-burst=10")
+                .arg("--drive-chunk-size=16M")
+                .arg("--buffer-size=16M")
+                .arg("--drive-acknowledge-abuse")
+                .arg("--drive-use-trash=false");
+        } else {
+            command
+                .arg("--transfers=8")
+                .arg("--checkers=16")
+                .arg("--drive-chunk-size=64M")
+                .arg("--drive-use-trash=false")
+                .arg("--buffer-size=32M");
+        }
+
+        command
             .stdout(Stdio::null())
             .stderr(Stdio::piped());
         if let Some(ref temp_manifest) = manifest_path_to_clean {
@@ -2495,6 +2517,40 @@ async fn connect_provider_with_fields(
     tauri::async_runtime::spawn_blocking(move || providers::connect_fields(&provider_id, fields))
         .await
         .map_err(|error| AppError::Transfer(format!("Cloud setup stopped: {error}")))?
+}
+
+/// Signs in to Google Drive with optional custom OAuth Client ID and Secret
+/// for dedicated API quota, and ensures root_folder_id is persisted.
+#[tauri::command]
+async fn connect_google_drive_oauth(
+    remote_name: Option<String>,
+    client_id: Option<String>,
+    client_secret: Option<String>,
+    root_folder_id: Option<String>,
+) -> AppResult<String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        providers::connect_google_drive(remote_name, client_id, client_secret, root_folder_id)
+    })
+    .await
+    .map_err(|error| AppError::Transfer(format!("Google Drive setup stopped: {error}")))?
+}
+
+/// Opens Google Cloud Console setup pages in the default web browser.
+#[tauri::command]
+fn open_gcp_console(target: String) -> AppResult<()> {
+    let url = match target.as_str() {
+        "enable_drive" => "https://console.cloud.google.com/flows/enableapi?apiid=drive.googleapis.com",
+        "consent" => "https://console.cloud.google.com/apis/credentials/consent",
+        "credentials" => "https://console.cloud.google.com/apis/credentials/oauthclient",
+        _ => "https://console.cloud.google.com/",
+    };
+    #[cfg(target_os = "linux")]
+    let _ = Command::new("xdg-open").arg(url).spawn();
+    #[cfg(target_os = "macos")]
+    let _ = Command::new("open").arg(url).spawn();
+    #[cfg(target_os = "windows")]
+    let _ = Command::new("cmd").args(["/c", "start", url]).spawn();
+    Ok(())
 }
 
 /// Forgets a cloud connection, refusing while any backup job still points at it.
@@ -3139,6 +3195,11 @@ pub fn run() {
                 start_scheduler(state);
             }
 
+            let tray_icon = app
+                .default_window_icon()
+                .cloned()
+                .unwrap_or_else(|| tauri::image::Image::new_owned(tray_pixels(), 16, 16));
+
             let show = MenuItem::with_id(app, "show", "Open CloudFolder", true, None::<&str>)?;
             let quit = MenuItem::with_id(
                 app,
@@ -3148,10 +3209,11 @@ pub fn run() {
                 None::<&str>,
             )?;
             let menu = Menu::with_items(app, &[&show, &quit])?;
-            TrayIconBuilder::new()
-                .tooltip("CloudFolder Sync")
-                .icon(tauri::image::Image::new_owned(tray_pixels(), 16, 16))
+            #[allow(unused_mut)]
+            let mut tray_builder = TrayIconBuilder::new()
+                .icon(tray_icon)
                 .menu(&menu)
+                .show_menu_on_left_click(true)
                 .on_menu_event(|app, event| match event.id.as_ref() {
                     "show" => show_main_window(app),
                     "quit" => app.exit(0),
@@ -3166,8 +3228,14 @@ pub fn run() {
                     {
                         show_main_window(tray.app_handle());
                     }
-                })
-                .build(app)?;
+                });
+
+            #[cfg(not(target_os = "linux"))]
+            {
+                tray_builder = tray_builder.tooltip("CloudFolder Sync");
+            }
+
+            tray_builder.build(app)?;
             Ok(())
         })
         .on_window_event(|window, event| {
@@ -3197,6 +3265,8 @@ pub fn run() {
             list_providers,
             connect_provider,
             connect_provider_with_fields,
+            connect_google_drive_oauth,
+            open_gcp_console,
             disconnect_remote,
             list_cloud_folders,
             create_cloud_folder,

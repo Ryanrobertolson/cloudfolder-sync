@@ -9,3 +9,7 @@ src-tauri/target/
 .agents/
 cloud-folder-browser.png
 src-tauri/gen/
+
+.claude/
+nimbalyst-local/
+prompt.md

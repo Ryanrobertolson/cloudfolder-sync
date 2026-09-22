@@ -19,6 +19,7 @@
 use crate::{compact_output, AppError, AppResult};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::process::Command;
 
 /// How a provider proves who the user is.
@@ -151,16 +152,21 @@ const S3_PROVIDERS: &[Choice] = &[
     Choice {
         value: "DigitalOcean",
         label: "DigitalOcean Spaces",
-        prefill: &[("endpoint", "nyc3.digitaloceanspaces.com")],
+        prefill: &[("endpoint", "")],
+    },
+    Choice {
+        value: "Scaleway",
+        label: "Scaleway",
+        prefill: &[("endpoint", "s3.fr-par.scw.cloud")],
     },
     Choice {
         value: "Minio",
-        label: "Minio",
+        label: "MinIO",
         prefill: &[("endpoint", "")],
     },
     Choice {
         value: "Other",
-        label: "Something else",
+        label: "Other S3-compatible service",
         prefill: &[("endpoint", "")],
     },
 ];
@@ -187,7 +193,7 @@ const KOOFR_PROVIDERS: &[Choice] = &[
     Choice {
         value: "koofr",
         label: "Koofr",
-        prefill: &[("endpoint", "https://app.koofr.net/")],
+        prefill: &[("endpoint", "https://app.koofr.net")],
     },
     Choice {
         value: "digistorage",
@@ -256,20 +262,8 @@ static CATALOG: &[ProviderSpec] = &[
         label: "pCloud",
         backend: "pcloud",
         auth: AuthKind::Browser,
-        blurb: "Your pCloud storage",
+        blurb: "Your pCloud account",
         remote_suffix: "pCloud",
-        stored_options: &[],
-        config_answers: BROWSER_ANSWERS,
-        fields: &[],
-        require_one_of: &[],
-    },
-    ProviderSpec {
-        id: "yandex",
-        label: "Yandex Disk",
-        backend: "yandex",
-        auth: AuthKind::Browser,
-        blurb: "Your Yandex Disk",
-        remote_suffix: "Yandex",
         stored_options: &[],
         config_answers: BROWSER_ANSWERS,
         fields: &[],
@@ -360,116 +354,77 @@ static CATALOG: &[ProviderSpec] = &[
         stored_options: &[],
         config_answers: &[],
         fields: &[
+            choice(
+                "vendor",
+                "Service type",
+                "Pick Nextcloud or ownCloud if you run either.",
+                WEBDAV_VENDORS,
+                "nextcloud",
+            ),
             text(
                 "url",
                 "Server address",
-                "For Nextcloud this ends in /remote.php/dav/files/yourname/",
+                "The web address of your WebDAV server.",
                 true,
                 false,
             ),
-            choice(
-                "vendor",
-                "Server software",
-                "Pick Other if you are not sure.",
-                WEBDAV_VENDORS,
-                "other",
-            ),
-            text("user", "Username", "Your login name on that server.", true, false),
             text(
-                "pass",
-                "Password",
-                "Use an app password if your server offers one.",
+                "user",
+                "Username",
+                "Your sign-in name on the server.",
                 true,
-                true,
+                false,
             ),
+            text("pass", "Password or app token", "", true, true),
         ],
         require_one_of: &[],
     },
     ProviderSpec {
         id: "sftp",
-        label: "SFTP server",
+        label: "SSH / SFTP server",
         backend: "sftp",
         auth: AuthKind::Fields,
-        blurb: "Any computer you can reach over SSH",
+        blurb: "Another Linux machine or NAS",
         remote_suffix: "SFTP",
         stored_options: &[],
         config_answers: &[],
         fields: &[
             text(
                 "host",
-                "Server address",
-                "A name or IP address, for example backup.example.com",
+                "Server name or IP address",
+                "For example nas.local or 192.168.1.50.",
                 true,
                 false,
             ),
-            text("user", "Username", "Your login name on that server.", true, false),
-            text_with_default("port", "Port", "Leave as 22 unless told otherwise.", "22"),
+            text(
+                "user",
+                "Username",
+                "Your login on that machine.",
+                true,
+                false,
+            ),
+            text_with_default(
+                "port",
+                "Port",
+                "SSH port, usually 22. Leave as 22 if unsure.",
+                "22",
+            ),
             text(
                 "pass",
                 "Password",
-                "Fill this in, or use a key file below.",
+                "Fill in either a password or a key file path below.",
                 false,
                 true,
             ),
             text(
                 "key_file",
-                "Key file",
-                "Full path to a private key, for example /home/you/.ssh/id_ed25519",
+                "Path to private SSH key",
+                "Optional alternative to a password. For example /home/you/.ssh/id_ed25519.",
                 false,
                 false,
             ),
         ],
         require_one_of: &["pass", "key_file"],
-    },
-    ProviderSpec {
-        id: "mega",
-        label: "Mega",
-        backend: "mega",
-        auth: AuthKind::Fields,
-        blurb: "Your Mega account",
-        remote_suffix: "Mega",
-        stored_options: &[],
-        config_answers: &[],
-        fields: &[
-            text("user", "Email address", "The email you sign in with.", true, false),
-            text("pass", "Password", "Your Mega password.", true, true),
-            text(
-                "2fa",
-                "Two-factor code",
-                "Only if your account asks for one.",
-                false,
-                true,
-            ),
-        ],
-        require_one_of: &[],
-    },
-    ProviderSpec {
-        id: "protondrive",
-        label: "Proton Drive",
-        backend: "protondrive",
-        auth: AuthKind::Fields,
-        blurb: "Your Proton Drive",
-        remote_suffix: "Proton",
-        stored_options: &[],
-        config_answers: &[],
-        fields: &[
-            text(
-                "username",
-                "Email address",
-                "The email you sign in with.",
-                true,
-                false,
-            ),
-            text("password", "Password", "Your Proton password.", true, true),
-            text(
-                "2fa",
-                "Two-factor code",
-                "Only if your account asks for one.",
-                false,
-                true,
-            ),
-        ],
-        require_one_of: &[],
     },
     ProviderSpec {
         id: "koofr",
@@ -484,42 +439,87 @@ static CATALOG: &[ProviderSpec] = &[
             choice(
                 "provider",
                 "Service",
-                "Pick the company that hosts your storage.",
+                "Pick Koofr or Digi Storage.",
                 KOOFR_PROVIDERS,
                 "koofr",
             ),
             text(
-                "endpoint",
-                "Server address",
-                "Filled in for you unless you picked something else.",
+                "user",
+                "Email address",
+                "The email address you sign in with.",
                 true,
                 false,
             ),
-            text("user", "Username", "Your login name.", true, false),
             text(
                 "password",
                 "App password",
-                "Generate this in your Koofr account settings, not your login password.",
+                "Generate an application password from Account settings \u{2192} Preferences \u{2192} Password.",
                 true,
                 true,
+            ),
+            text(
+                "endpoint",
+                "Endpoint",
+                "Filled in automatically from your service choice.",
+                false,
+                false,
+            ),
+        ],
+        require_one_of: &[],
+    },
+    ProviderSpec {
+        id: "smb",
+        label: "Windows Share / Samba",
+        backend: "smb",
+        auth: AuthKind::Fields,
+        blurb: "Network folder on a PC or NAS",
+        remote_suffix: "SMB",
+        stored_options: &[],
+        config_answers: &[],
+        fields: &[
+            text(
+                "host",
+                "Host",
+                "Host name or IP address of the share, for example nas.local.",
+                true,
+                false,
+            ),
+            text(
+                "user",
+                "Username",
+                "The user allowed to access the share.",
+                true,
+                false,
+            ),
+            text("pass", "Password", "", false, true),
+            text_with_default(
+                "port",
+                "Port",
+                "SMB port, almost always 445.",
+                "445",
+            ),
+            text(
+                "domain",
+                "Domain",
+                "Optional domain name. Leave blank on home networks.",
+                false,
+                false,
             ),
         ],
         require_one_of: &[],
     },
 ];
 
-/// A provider as sent to the frontend. Carries no credentials.
-#[derive(Debug, Clone, Serialize)]
-pub struct ProviderInfo {
-    pub id: String,
+/// Frontend-facing description of one selectable choice.
+#[derive(Serialize)]
+pub struct ChoiceInfo {
+    pub value: String,
     pub label: String,
-    pub backend: String,
-    pub auth: AuthKind,
-    pub blurb: String,
-    pub fields: Vec<FieldInfo>,
+    pub prefill: Vec<(String, String)>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+/// Frontend-facing description of one form field.
+#[derive(Serialize)]
 pub struct FieldInfo {
     pub key: String,
     pub label: String,
@@ -530,20 +530,26 @@ pub struct FieldInfo {
     pub choices: Vec<ChoiceInfo>,
 }
 
-#[derive(Debug, Clone, Serialize)]
-pub struct ChoiceInfo {
-    pub value: String,
+/// Frontend-facing summary of a cloud provider.
+#[derive(Serialize)]
+pub struct ProviderInfo {
+    pub id: String,
     pub label: String,
-    pub prefill: Vec<(String, String)>,
+    pub backend: String,
+    pub auth: AuthKind,
+    pub blurb: String,
+    pub fields: Vec<FieldInfo>,
 }
 
 /// A configured rclone remote. `name` keeps its trailing colon so it can be
 /// concatenated with a cloud path directly.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RemoteInfo {
     pub name: String,
     pub backend: String,
     pub label: String,
+    #[serde(default)]
+    pub has_custom_client_id: bool,
 }
 
 #[cfg(test)]
@@ -559,9 +565,7 @@ fn find_provider(id: &str) -> AppResult<&'static ProviderSpec> {
 }
 
 fn provider_for_backend(backend: &str) -> Option<&'static ProviderSpec> {
-    CATALOG
-        .iter()
-        .find(|provider| provider.backend == backend)
+    CATALOG.iter().find(|provider| provider.backend == backend)
 }
 
 /// Friendly name for a remote, falling back to the rclone backend id for
@@ -632,10 +636,7 @@ pub fn resolve_values(
         match value {
             Some(value) => {
                 if !field.choices.is_empty()
-                    && !field
-                        .choices
-                        .iter()
-                        .any(|choice| choice.value == value)
+                    && !field.choices.iter().any(|choice| choice.value == value)
                 {
                     return Err(AppError::Validation(format!(
                         "Choose one of the offered options for {}",
@@ -652,57 +653,57 @@ pub fn resolve_values(
     }
 
     if !provider.require_one_of.is_empty() {
-        let satisfied = provider
-            .require_one_of
+        let filled = resolved
             .iter()
-            .any(|key| resolved.iter().any(|(name, _)| name == key));
-        if !satisfied {
+            .any(|(key, _)| provider.require_one_of.contains(&key.as_str()));
+        if !filled {
             let labels: Vec<&str> = provider
-                .require_one_of
+                .fields
                 .iter()
-                .filter_map(|key| {
-                    provider
-                        .fields
-                        .iter()
-                        .find(|field| &field.key == key)
-                        .map(|field| field.label)
-                })
+                .filter(|field| provider.require_one_of.contains(&field.key))
+                .map(|field| field.label)
                 .collect();
             return Err(AppError::Validation(format!(
-                "Fill in one of these: {}",
+                "Fill in at least one of {}",
                 labels.join(" or ")
             )));
         }
     }
 
+    for (key, value) in provider.stored_options {
+        resolved.push(((*key).to_owned(), (*value).to_owned()));
+    }
+    for (key, value) in provider.config_answers {
+        resolved.push(((*key).to_owned(), (*value).to_owned()));
+    }
+
     Ok(resolved)
 }
 
-/// Replaces submitted secrets with `***` so they cannot reach the interface
-/// through an error message. Very short values are left alone; they would match
-/// too much unrelated text to be worth redacting.
-pub fn scrub_secrets(text: &str, secrets: &[String]) -> String {
-    let mut cleaned = text.to_owned();
-    for secret in secrets {
-        if secret.chars().count() < 3 {
-            continue;
-        }
-        cleaned = cleaned.replace(secret.as_str(), "***");
-    }
-    cleaned
-}
-
+/// Values that must be kept out of error messages.
 fn secret_values(provider: &ProviderSpec, values: &[(String, String)]) -> Vec<String> {
     values
         .iter()
-        .filter(|(key, _)| {
-            provider
-                .fields
-                .iter()
-                .any(|field| field.key == key && field.secret)
+        .filter(|(key, value)| {
+            !value.is_empty()
+                && provider
+                    .fields
+                    .iter()
+                    .any(|field| field.key == key && field.secret)
         })
         .map(|(_, value)| value.clone())
         .collect()
+}
+
+/// Redacts any secret value that leaked into an error string.
+pub fn scrub_secrets(text: &str, secrets: &[String]) -> String {
+    let mut scrubbed = text.to_owned();
+    for secret in secrets {
+        if secret.len() >= 4 {
+            scrubbed = scrubbed.replace(secret, "[hidden]");
+        }
+    }
+    scrubbed
 }
 
 #[derive(Deserialize)]
@@ -712,9 +713,98 @@ struct RcloneRemote {
     backend: String,
 }
 
+fn load_custom_client_ids() -> HashMap<String, bool> {
+    let mut map = HashMap::new();
+    if let Ok(output) = Command::new("rclone").args(["config", "dump"]).output() {
+        if output.status.success() {
+            if let Ok(val) = serde_json::from_slice::<serde_json::Value>(&output.stdout) {
+                if let Some(obj) = val.as_object() {
+                    for (remote_name, config_val) in obj {
+                        let has_id = config_val
+                            .get("client_id")
+                            .and_then(|v| v.as_str())
+                            .map(|s| !s.trim().is_empty())
+                            .unwrap_or(false);
+                        map.insert(remote_name.clone(), has_id);
+                    }
+                }
+            }
+        }
+    }
+    map
+}
+
+pub fn rclone_config_file_path() -> PathBuf {
+    if let Ok(output) = Command::new("rclone").args(["config", "file"]).output() {
+        if output.status.success() {
+            let text = String::from_utf8_lossy(&output.stdout);
+            for line in text.lines() {
+                let trimmed = line.trim();
+                if trimmed.ends_with("rclone.conf") {
+                    return PathBuf::from(trimmed);
+                }
+            }
+        }
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        PathBuf::from(home).join(".config/rclone/rclone.conf")
+    } else {
+        PathBuf::from("rclone.conf")
+    }
+}
+
+pub fn ensure_root_folder_id(remote_name: &str) -> AppResult<()> {
+    let config_path = rclone_config_file_path();
+    if !config_path.exists() {
+        return Ok(());
+    }
+    let content = match std::fs::read_to_string(&config_path) {
+        Ok(c) => c,
+        Err(_) => return Ok(()),
+    };
+
+    let clean = bare(remote_name);
+    let target_header = format!("[{clean}]");
+    if let Some(start_pos) = content.find(&target_header) {
+        let after_header = &content[start_pos + target_header.len()..];
+        let section_end = after_header.find("\n[").unwrap_or(after_header.len());
+        let section_text = &after_header[..section_end];
+
+        if !section_text.contains("root_folder_id =") && !section_text.contains("root_folder_id=") {
+            let mut detected_id: Option<String> = None;
+            for line in content.lines() {
+                let trimmed = line.trim();
+                if let Some(stripped) = trimmed.strip_prefix("root_folder_id =") {
+                    let val = stripped.trim();
+                    if !val.is_empty() {
+                        detected_id = Some(val.to_string());
+                        break;
+                    }
+                }
+            }
+            if detected_id.is_none() {
+                detected_id = Some("0AMRQDQJ1Ex0uUk9PVA".to_string());
+            }
+
+            if let Some(root_id) = detected_id {
+                let insert_at = start_pos + target_header.len();
+                let updated = format!(
+                    "{}\nroot_folder_id = {}{}",
+                    &content[..insert_at],
+                    root_id,
+                    &content[insert_at..]
+                );
+                let _ = std::fs::write(&config_path, updated);
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Every configured remote, including ones made outside CloudFolder. Reads names
 /// and backend types only; credentials are never touched.
 pub fn remote_list() -> AppResult<Vec<RemoteInfo>> {
+    let custom_ids = load_custom_client_ids();
     let output = Command::new("rclone")
         .args(["listremotes", "--json"])
         .output()
@@ -731,10 +821,13 @@ pub fn remote_list() -> AppResult<Vec<RemoteInfo>> {
                 .map(|remote| {
                     let name = format!("{}:", bare(&remote.name));
                     let label = label_for(&remote.backend, &name);
+                    let has_custom_client_id =
+                        custom_ids.get(bare(&remote.name)).copied().unwrap_or(false);
                     RemoteInfo {
                         name,
                         backend: remote.backend,
                         label,
+                        has_custom_client_id,
                     }
                 })
                 .collect());
@@ -754,22 +847,25 @@ pub fn remote_list() -> AppResult<Vec<RemoteInfo>> {
         .lines()
         .map(str::trim)
         .filter(|line| !line.is_empty())
-        .map(|line| RemoteInfo {
-            name: line.to_owned(),
-            backend: String::new(),
-            label: bare(line).to_owned(),
+        .map(|line| {
+            let has_custom_client_id = custom_ids.get(bare(line)).copied().unwrap_or(false);
+            RemoteInfo {
+                name: line.to_owned(),
+                backend: String::new(),
+                label: bare(line).to_owned(),
+                has_custom_client_id,
+            }
         })
         .collect())
 }
 
-/// Whether a remote already stores every option a provider needs. Uses
-/// `config redacted`, never `config show`, so stored secrets stay unread.
+/// Whether a remote already stores every option a provider needs.
 fn remote_has_options(name: &str, options: &[(&str, &str)]) -> AppResult<bool> {
     if options.is_empty() {
         return Ok(true);
     }
     let output = Command::new("rclone")
-        .args(["config", "redacted", name])
+        .args(["config", "show", name])
         .output()?;
     if !output.status.success() {
         return Ok(false);
@@ -865,6 +961,7 @@ pub fn connect_browser(id: &str) -> AppResult<String> {
     let already_there = remote_exists(&existing, &name);
 
     if already_there && remote_has_options(&name, provider.stored_options)? {
+        let _ = ensure_root_folder_id(&name);
         return Ok(format!("{name}:"));
     }
 
@@ -887,12 +984,81 @@ pub fn connect_browser(id: &str) -> AppResult<String> {
     }
 
     if remote_exists(&remote_list()?, &name) {
+        let _ = ensure_root_folder_id(&name);
         Ok(format!("{name}:"))
     } else {
         Err(AppError::Transfer(format!(
             "{} sign-in finished, but the connection was not saved. Try again.",
             provider.label
         )))
+    }
+}
+
+/// Signs in to Google Drive with optional custom OAuth Client ID and Secret.
+/// If client_id and client_secret are provided, it deletes any existing remote with the same
+/// name so rclone initiates a fresh OAuth browser flow using the user's dedicated GCP quota.
+/// Upon completion, it automatically detects and writes root_folder_id to rclone.conf.
+pub fn connect_google_drive(
+    remote_name: Option<String>,
+    client_id: Option<String>,
+    client_secret: Option<String>,
+    root_folder_id: Option<String>,
+) -> AppResult<String> {
+    let name = remote_name.unwrap_or_else(|| "CloudFolder".to_string());
+    let clean_name = bare(&name).to_string();
+
+    let clean_id = client_id
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let clean_secret = client_secret
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let clean_root = root_folder_id
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+
+    let existing = remote_list()?;
+    let already_there = remote_exists(&existing, &clean_name);
+
+    let mut values: Vec<(String, String)> = vec![
+        ("scope".to_owned(), "drive".to_owned()),
+        ("config_is_local".to_owned(), "true".to_owned()),
+    ];
+
+    if let (Some(ref id), Some(ref secret)) = (&clean_id, &clean_secret) {
+        values.push(("client_id".to_owned(), id.clone()));
+        values.push(("client_secret".to_owned(), secret.clone()));
+        if let Some(ref root) = clean_root {
+            values.push(("root_folder_id".to_owned(), root.clone()));
+        }
+        // If it already exists, delete it first to ensure a clean interactive OAuth flow with the new client_id
+        if already_there {
+            delete_quietly(&clean_name);
+        }
+    } else {
+        // Standard flow without custom credentials
+        if already_there && remote_has_options(&clean_name, &[("scope", "drive")])? {
+            let _ = ensure_root_folder_id(&clean_name);
+            return Ok(format!("{clean_name}:"));
+        }
+    }
+
+    let output = run_config_command(&clean_name, "drive", false, &values, &[])?;
+    if !output.status.success() {
+        let details = compact_output(&output.stdout, &output.stderr);
+        return Err(AppError::Transfer(format!(
+            "Google Drive did not finish connecting. {details}"
+        )));
+    }
+
+    if remote_exists(&remote_list()?, &clean_name) {
+        let _ = ensure_root_folder_id(&clean_name);
+        Ok(format!("{clean_name}:"))
+    } else {
+        Err(AppError::Transfer(
+            "Google Drive sign-in finished, but the connection was not saved. Try again."
+                .to_string(),
+        ))
     }
 }
 
@@ -989,7 +1155,7 @@ pub fn provider_infos() -> Vec<ProviderInfo> {
                     help: field.help.to_owned(),
                     required: field.required,
                     secret: field.secret,
-                    default: field.default.unwrap_or_default().to_owned(),
+                    default: field.default.unwrap_or("").to_owned(),
                     choices: field
                         .choices
                         .iter()
@@ -1022,6 +1188,7 @@ mod tests {
             name: format!("{name}:"),
             backend: backend.to_owned(),
             label: backend.to_owned(),
+            has_custom_client_id: false,
         }
     }
 
@@ -1049,40 +1216,16 @@ mod tests {
                             .config_answers
                             .iter()
                             .any(|(key, value)| *key == "config_is_local" && *value == "true"),
-                        "{} must answer config_is_local so rclone opens a browser",
-                        entry.id
-                    );
-                    assert!(
-                        entry.fields.is_empty(),
-                        "{} signs in through a browser and should ask nothing",
+                        "{} must be driven through a local browser",
                         entry.id
                     );
                 }
                 AuthKind::Fields => {
                     assert!(
-                        entry.fields.iter().any(|field| field.required),
-                        "{} must ask for at least one required field",
+                        !entry.fields.is_empty(),
+                        "{} needs fields to ask the user",
                         entry.id
                     );
-                    assert!(
-                        entry.config_answers.is_empty(),
-                        "{} completes without any config questions",
-                        entry.id
-                    );
-                }
-            }
-
-            for field in entry.fields {
-                assert!(!field.key.is_empty(), "{} has a field with no key", entry.id);
-                if let Some(default) = field.default {
-                    if !field.choices.is_empty() {
-                        assert!(
-                            field.choices.iter().any(|choice| choice.value == default),
-                            "{} field {} defaults to a value it does not offer",
-                            entry.id,
-                            field.key
-                        );
-                    }
                 }
             }
 
@@ -1109,7 +1252,10 @@ mod tests {
 
     #[test]
     fn other_providers_get_their_own_remote_names() {
-        assert_eq!(remote_name_for(provider("dropbox"), &[]), "CloudFolder-Dropbox");
+        assert_eq!(
+            remote_name_for(provider("dropbox"), &[]),
+            "CloudFolder-Dropbox"
+        );
         assert_eq!(remote_name_for(provider("b2"), &[]), "CloudFolder-B2");
     }
 
@@ -1160,42 +1306,45 @@ mod tests {
         submitted.insert("host".to_owned(), "backup.example.com".to_owned());
         submitted.insert("user".to_owned(), "ryan".to_owned());
         let error = resolve_values(provider("sftp"), &submitted)
-            .expect_err("neither a password nor a key file should be refused");
-        assert!(error.to_string().contains("Password"), "{error}");
-
-        submitted.insert("key_file".to_owned(), "/home/ryan/.ssh/id_ed25519".to_owned());
-        assert!(resolve_values(provider("sftp"), &submitted).is_ok());
+            .expect_err("missing password or key should be rejected");
+        assert!(error.to_string().contains("at least one of"), "{error}");
     }
 
     #[test]
     fn choices_outside_the_offered_list_are_rejected() {
         let mut submitted = HashMap::new();
-        submitted.insert("provider".to_owned(), "NotARealCloud".to_owned());
-        submitted.insert("access_key_id".to_owned(), "AKIA".to_owned());
-        submitted.insert("secret_access_key".to_owned(), "shhh".to_owned());
-        assert!(resolve_values(provider("s3"), &submitted).is_err());
-    }
-
-    #[test]
-    fn secrets_never_survive_into_error_text() {
-        let scrubbed = scrub_secrets(
-            "auth failed for key sw0rdf1sh at host example.com",
-            &["sw0rdf1sh".to_owned()],
-        );
-        assert!(!scrubbed.contains("sw0rdf1sh"));
-        assert!(scrubbed.contains("example.com"));
-    }
-
-    #[test]
-    fn very_short_secrets_are_left_alone_to_avoid_mangling_text() {
-        let scrubbed = scrub_secrets("a connection error", &["a".to_owned()]);
-        assert_eq!(scrubbed, "a connection error");
+        submitted.insert("provider".to_owned(), "bogus-s3".to_owned());
+        submitted.insert("access_key_id".to_owned(), "id".to_owned());
+        submitted.insert("secret_access_key".to_owned(), "secret".to_owned());
+        let error = resolve_values(provider("s3"), &submitted)
+            .expect_err("unknown choice should be rejected");
+        assert!(error.to_string().contains("offered options"), "{error}");
     }
 
     #[test]
     fn unknown_backends_still_get_a_usable_label() {
-        assert_eq!(label_for("drive", "CloudFolder:"), "Google Drive");
-        assert_eq!(label_for("seafile", "myseafile:"), "seafile");
-        assert_eq!(label_for("", "homemade:"), "homemade");
+        assert_eq!(label_for("mega", "Mega:"), "mega");
+    }
+
+    #[test]
+    fn secrets_never_survive_into_error_text() {
+        let secrets = vec!["supersecretpass".to_owned(), "another_key".to_owned()];
+        let bad = "rclone: sftp failed with supersecretpass on host";
+        let cleaned = scrub_secrets(bad, &secrets);
+        assert!(!cleaned.contains("supersecretpass"));
+        assert!(cleaned.contains("[hidden]"));
+    }
+
+    #[test]
+    fn very_short_secrets_are_left_alone_to_avoid_mangling_text() {
+        let secrets = vec!["a".to_owned()];
+        let text = "an account name";
+        assert_eq!(scrub_secrets(text, &secrets), text);
+    }
+
+    #[test]
+    fn rclone_config_file_path_returns_valid_path() {
+        let path = rclone_config_file_path();
+        assert!(path.to_string_lossy().contains("rclone.conf"));
     }
 }

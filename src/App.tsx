@@ -18,6 +18,7 @@ interface RemoteInfo {
   name: string;
   backend: string;
   label: string;
+  has_custom_client_id?: boolean;
 }
 
 interface ProviderChoice {
@@ -332,6 +333,13 @@ export default function App() {
   const [cloudSetupStatus, setCloudSetupStatus] =
     useState<CloudSetupStatus>("picker");
   const [cloudSetupMessage, setCloudSetupMessage] = useState<string | null>(null);
+  const [showGdriveModal, setShowGdriveModal] = useState(false);
+  const [gdriveClientId, setGdriveClientId] = useState("");
+  const [gdriveClientSecret, setGdriveClientSecret] = useState("");
+  const [gdriveRootFolderId, setGdriveRootFolderId] = useState("");
+  const [gdriveRemoteName, setGdriveRemoteName] = useState("CloudFolder");
+  const [gdriveConnecting, setGdriveConnecting] = useState(false);
+  const [gdriveError, setGdriveError] = useState<string | null>(null);
   const [activeProvider, setActiveProvider] = useState<CloudProvider | null>(
     null,
   );
@@ -1245,9 +1253,53 @@ export default function App() {
     setShowCloudSetup(true);
   }
 
+  async function openGcpLink(target: "enable_drive" | "consent" | "credentials") {
+    try {
+      await invoke("open_gcp_console", { target });
+    } catch {
+      const urls: Record<string, string> = {
+        enable_drive: "https://console.cloud.google.com/flows/enableapi?apiid=drive.googleapis.com",
+        consent: "https://console.cloud.google.com/apis/credentials/consent",
+        credentials: "https://console.cloud.google.com/apis/credentials/oauthclient",
+      };
+      window.open(urls[target], "_blank");
+    }
+  }
+
+  async function submitGoogleDriveCustomOauth(event: React.FormEvent) {
+    event.preventDefault();
+    setGdriveConnecting(true);
+    setGdriveError(null);
+    try {
+      await invoke<string>("connect_google_drive_oauth", {
+        remoteName: gdriveRemoteName || null,
+        clientId: gdriveClientId.trim() || null,
+        clientSecret: gdriveClientSecret.trim() || null,
+        rootFolderId: gdriveRootFolderId.trim() || null,
+      });
+      await refresh();
+      setShowGdriveModal(false);
+      setCloudSetupStatus("success");
+      setCloudSetupMessage("Google Drive connected with dedicated high-speed quota!");
+    } catch (reason) {
+      setGdriveError(String(reason));
+    } finally {
+      setGdriveConnecting(false);
+    }
+  }
+
   function startProvider(provider: CloudProvider) {
     setActiveProvider(provider);
     setCloudSetupMessage(null);
+    if (provider.id === "google_drive") {
+      setGdriveRemoteName("CloudFolder");
+      setGdriveClientId("");
+      setGdriveClientSecret("");
+      setGdriveRootFolderId("");
+      setGdriveError(null);
+      setShowGdriveModal(true);
+      return;
+    }
     if (provider.auth === "browser") {
       void connectBrowserProvider(provider);
     } else {
@@ -1826,18 +1878,42 @@ export default function App() {
                     <p className="field-label">Already connected</p>
                     {remotes.map((remote) => (
                       <div className="connected-remote" key={remote.name}>
-                        <span aria-hidden="true">✓</span>
-                        <div>
+                        <div className="connected-remote-badge" aria-hidden="true">✓</div>
+                        <div className="connected-remote-details">
                           <strong>{remote.label}</strong>
                           <small>{remote.name.replace(/:$/, "")}</small>
                         </div>
-                        <button
-                          type="button"
-                          className="link-button"
-                          onClick={() => void disconnectRemote(remote)}
-                        >
-                          Disconnect
-                        </button>
+                        <div className="connected-remote-actions">
+                          {remote.backend === "drive" && (
+                            remote.has_custom_client_id ? (
+                              <span className="quota-pill">
+                                ⚡ High-Speed Quota
+                              </span>
+                            ) : (
+                              <button
+                                type="button"
+                                className="upgrade-quota-btn"
+                                onClick={() => {
+                                  setGdriveRemoteName(remote.name.replace(/:$/, ""));
+                                  setGdriveClientId("");
+                                  setGdriveClientSecret("");
+                                  setGdriveRootFolderId("");
+                                  setGdriveError(null);
+                                  setShowGdriveModal(true);
+                                }}
+                              >
+                                ⚡ Upgrade Speed
+                              </button>
+                            )
+                          )}
+                          <button
+                            type="button"
+                            className="disconnect-btn"
+                            onClick={() => void disconnectRemote(remote)}
+                          >
+                            Disconnect
+                          </button>
+                        </div>
                       </div>
                     ))}
                   </div>
@@ -1896,6 +1972,185 @@ export default function App() {
                 </button>
               </>
             )}
+          </section>
+        </div>
+      )}
+
+      {showGdriveModal && (
+        <div
+          className="modal-backdrop"
+          onMouseDown={() => !gdriveConnecting && setShowGdriveModal(false)}
+        >
+          <section
+            className="modal gdrive-oauth-modal"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="gdrive-oauth-title"
+            onMouseDown={(e) => e.stopPropagation()}
+          >
+            <button
+              className="modal-close"
+              aria-label="Close"
+              disabled={gdriveConnecting}
+              onClick={() => setShowGdriveModal(false)}
+            >
+              ×
+            </button>
+            <div className="cloud-setup-heading">
+              <div
+                className="cloud-setup-icon"
+                style={{ background: "#e8f0fe", color: "#1a73e8", fontSize: "28px" }}
+              >
+                ⚡
+              </div>
+              <div>
+                <h2 id="gdrive-oauth-title">High-Speed Google Drive Setup</h2>
+                <p>
+                  Bypass shared Google rate limits with your private Google Cloud quota (5x–8x faster transfers).
+                </p>
+              </div>
+            </div>
+
+            <ol className="kid-steps">
+              <li>
+                <span>1</span>
+                <div>
+                  <strong>Enable Google Drive API</strong>
+                  <small>Open Google Cloud Console and click &quot;Enable&quot;.</small>
+                  <button
+                    type="button"
+                    className="gcp-action-btn"
+                    onClick={() => void openGcpLink("enable_drive")}
+                  >
+                    Open API Library ↗
+                  </button>
+                </div>
+              </li>
+              <li>
+                <span>2</span>
+                <div>
+                  <strong>Configure OAuth &amp; Create Credentials</strong>
+                  <small>OAuth Consent: External / Testing. Credentials: Desktop App.</small>
+                  <div style={{ display: "flex", gap: "8px", flexWrap: "wrap" }}>
+                    <button
+                      type="button"
+                      className="gcp-action-btn"
+                      onClick={() => void openGcpLink("consent")}
+                    >
+                      OAuth Consent Screen ↗
+                    </button>
+                    <button
+                      type="button"
+                      className="gcp-action-btn"
+                      onClick={() => void openGcpLink("credentials")}
+                    >
+                      Create Credentials ↗
+                    </button>
+                  </div>
+                </div>
+              </li>
+              <li>
+                <span>3</span>
+                <div>
+                  <strong>Paste Your Dedicated Credentials</strong>
+                  <small>Stored locally on your machine in rclone.conf.</small>
+                </div>
+              </li>
+            </ol>
+
+            {gdriveError && (
+              <div className="simple-error">
+                <strong>Connection Error</strong>
+                <p>{gdriveError}</p>
+              </div>
+            )}
+
+            <form className="gdrive-form" onSubmit={submitGoogleDriveCustomOauth}>
+              <div>
+                <label htmlFor="gdrive-client-id">
+                  Client ID <span style={{ color: "#d97706" }}>*</span>
+                </label>
+                <input
+                  id="gdrive-client-id"
+                  type="text"
+                  placeholder="e.g. 123456789-abcdef.apps.googleusercontent.com"
+                  value={gdriveClientId}
+                  onChange={(e) => setGdriveClientId(e.target.value)}
+                  disabled={gdriveConnecting}
+                  required
+                />
+              </div>
+
+              <div>
+                <label htmlFor="gdrive-client-secret">
+                  Client Secret <span style={{ color: "#d97706" }}>*</span>
+                </label>
+                <input
+                  id="gdrive-client-secret"
+                  type="password"
+                  placeholder="e.g. GOCSPX-xxxxxxxxxxxxxxxx"
+                  value={gdriveClientSecret}
+                  onChange={(e) => setGdriveClientSecret(e.target.value)}
+                  disabled={gdriveConnecting}
+                  required
+                />
+              </div>
+
+              <div>
+                <label htmlFor="gdrive-root-id">
+                  Root Folder ID (Optional)
+                </label>
+                <input
+                  id="gdrive-root-id"
+                  type="text"
+                  placeholder="e.g. 0AMRQDQJ1Ex0uUk9PVA (leave blank to auto-detect)"
+                  value={gdriveRootFolderId}
+                  onChange={(e) => setGdriveRootFolderId(e.target.value)}
+                  disabled={gdriveConnecting}
+                />
+              </div>
+
+              <div style={{ display: "flex", gap: "10px", marginTop: "10px" }}>
+                <button
+                  type="submit"
+                  className="primary giant-button"
+                  disabled={
+                    gdriveConnecting ||
+                    !gdriveClientId.trim() ||
+                    !gdriveClientSecret.trim()
+                  }
+                  style={{ flex: 1 }}
+                >
+                  {gdriveConnecting
+                    ? "Waiting for Browser Sign-in..."
+                    : "Authorize & Connect High-Speed"}
+                </button>
+                <button
+                  type="button"
+                  className="secondary"
+                  disabled={gdriveConnecting}
+                  onClick={() => setShowGdriveModal(false)}
+                >
+                  Cancel
+                </button>
+              </div>
+
+              <div style={{ textAlign: "center", marginTop: "6px" }}>
+                <button
+                  type="button"
+                  className="advanced-link"
+                  disabled={gdriveConnecting}
+                  onClick={() => {
+                    setShowGdriveModal(false);
+                    if (activeProvider) {
+                      void connectBrowserProvider(activeProvider);
+                    }
+                  }}
+                >
+                  Or sign in with Standard Mode (uses shared Google rate limits)
+                </button>
+              </div>
+            </form>
           </section>
         </div>
       )}

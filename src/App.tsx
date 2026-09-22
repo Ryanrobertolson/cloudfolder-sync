@@ -1088,6 +1088,37 @@ export default function App() {
     setActivityAutoScroll(true);
   }
 
+  async function clearJobActivity(jobId: number) {
+    try {
+      await invoke("clear_job_activity", { jobId });
+      setInlineLogs((curr) => ({ ...curr, [jobId]: [] }));
+      if (activityJob?.id === jobId) {
+        setActivityEntries([]);
+      }
+    } catch (reason) {
+      setError(String(reason));
+    }
+  }
+
+  async function clearErrorLogs() {
+    try {
+      await invoke("clear_error_logs");
+      setErrorLogs([]);
+    } catch (reason) {
+      setError(String(reason));
+    }
+  }
+
+  async function clearAllActivityLogs() {
+    try {
+      await invoke("clear_all_activity");
+      setInlineLogs({});
+      setActivityEntries([]);
+    } catch (reason) {
+      setError(String(reason));
+    }
+  }
+
   async function copyActivityLog() {
     if (activityEntries.length === 0) return;
     const text = activityEntries
@@ -1747,7 +1778,20 @@ export default function App() {
                                   <div className="inline-log-drawer">
                                     <div className="inline-log-header">
                                       <span>Live Activity Feed</span>
-                                      <small>Auto-scrolling</small>
+                                      <div style={{ display: "flex", gap: "8px", alignItems: "center" }}>
+                                        <button
+                                          type="button"
+                                          className="inline-log-clear-btn"
+                                          onClick={(e) => {
+                                            e.stopPropagation();
+                                            void clearJobActivity(job.id);
+                                          }}
+                                          title="Clear live activity log for this backup"
+                                        >
+                                          Clear log
+                                        </button>
+                                        <small>Auto-scrolling</small>
+                                      </div>
                                     </div>
                                     <div
                                       className="inline-log-body"
@@ -2399,6 +2443,20 @@ export default function App() {
               {settingsError && (
                 <div className="inline-error">{settingsError}</div>
               )}
+              <div className="settings-maintenance-card">
+                <div>
+                  <strong>Activity Logs Maintenance</strong>
+                  <p>Clear cached activity history across all backup jobs.</p>
+                </div>
+                <button
+                  type="button"
+                  className="secondary danger-btn"
+                  onClick={() => void clearAllActivityLogs()}
+                >
+                  Clear all activity logs
+                </button>
+              </div>
+
               <div className="modal-actions">
                 <button
                   type="button"
@@ -3447,6 +3505,14 @@ export default function App() {
                   {errorLogsLoading ? "Checking…" : "Refresh"}
                 </button>
                 <button
+                  className="secondary"
+                  onClick={() => void clearErrorLogs()}
+                  disabled={errorLogs.length === 0}
+                  title="Clear all saved error logs"
+                >
+                  Clear errors
+                </button>
+                <button
                   className="primary"
                   onClick={() => void copyErrorReport()}
                   disabled={errorLogs.length === 0}
@@ -3725,6 +3791,14 @@ export default function App() {
                   }
                 >
                   {activityLoading ? "Refreshing…" : "Refresh"}
+                </button>
+                <button
+                  className="secondary"
+                  disabled={activityEntries.length === 0}
+                  onClick={() => void clearJobActivity(currentActivityJob.id)}
+                  title="Clear saved activity logs for this backup"
+                >
+                  Clear log
                 </button>
                 <button
                   className="secondary"

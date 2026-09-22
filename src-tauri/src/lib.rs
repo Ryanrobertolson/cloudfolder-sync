@@ -2472,6 +2472,27 @@ fn job_activity(job_id: i64, state: State<'_, AppState>) -> AppResult<Vec<Activi
     query_job_activity(&connection, job_id)
 }
 
+#[tauri::command]
+fn clear_job_activity(job_id: i64, state: State<'_, AppState>) -> AppResult<()> {
+    let connection = connect(&state.db_path)?;
+    connection.execute("DELETE FROM backup_activity WHERE job_id = ?1", [job_id])?;
+    Ok(())
+}
+
+#[tauri::command]
+fn clear_all_activity(state: State<'_, AppState>) -> AppResult<()> {
+    let connection = connect(&state.db_path)?;
+    connection.execute("DELETE FROM backup_activity", [])?;
+    Ok(())
+}
+
+#[tauri::command]
+fn clear_error_logs(state: State<'_, AppState>) -> AppResult<()> {
+    let connection = connect(&state.db_path)?;
+    connection.execute("DELETE FROM runs WHERE status = 'error'", [])?;
+    Ok(())
+}
+
 fn query_error_logs(connection: &Connection) -> AppResult<Vec<ErrorLog>> {
     let mut statement = connection.prepare(
         "SELECT runs.id, runs.job_id, jobs.name, runs.started_at,
@@ -3281,6 +3302,9 @@ pub fn run() {
             restore_version_file,
             job_history,
             job_activity,
+            clear_job_activity,
+            clear_all_activity,
+            clear_error_logs,
             list_error_logs,
             list_remotes,
             list_providers,
@@ -3424,6 +3448,30 @@ mod tests {
         );
         assert_eq!(activity_state_for_line("transfer failed", false), "error");
         assert_eq!(activity_state_for_line("50%", true), "copying");
+    }
+
+    #[test]
+    fn activity_can_be_cleared_by_job_or_all() {
+        let connection = Connection::open_in_memory().expect("open activity database");
+        connection
+            .execute_batch(
+                "CREATE TABLE backup_activity (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    job_id INTEGER NOT NULL,
+                    occurred_at TEXT NOT NULL,
+                    state TEXT NOT NULL,
+                    message TEXT NOT NULL
+                );",
+            )
+            .expect("create activity table");
+        record_activity(&connection, 1, "info", "Job 1 log").expect("record");
+        record_activity(&connection, 2, "info", "Job 2 log").expect("record");
+        assert_eq!(query_job_activity(&connection, 1).unwrap().len(), 1);
+        connection.execute("DELETE FROM backup_activity WHERE job_id = ?1", [1]).unwrap();
+        assert_eq!(query_job_activity(&connection, 1).unwrap().len(), 0);
+        assert_eq!(query_job_activity(&connection, 2).unwrap().len(), 1);
+        connection.execute("DELETE FROM backup_activity", []).unwrap();
+        assert_eq!(query_job_activity(&connection, 2).unwrap().len(), 0);
     }
 
     #[test]

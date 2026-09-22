@@ -539,13 +539,26 @@ h2 {
 }
 
 .job-card {
-  justify-content: space-between;
+  display: flex;
+  flex-direction: column;
   min-width: 0;
+  width: 100%;
+  box-sizing: border-box;
   padding: 19px;
   border: 1px solid var(--line);
   border-radius: 12px;
   background: var(--surface);
   box-shadow: 0 3px 9px rgb(26 48 36 / 3%);
+  transition: all 0.15s ease;
+}
+
+.job-card-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  width: 100%;
+  min-width: 0;
+  gap: 24px;
 }
 
 .job-card:hover {
@@ -689,9 +702,12 @@ h2 {
 }
 
 .running-job-controls {
-  display: grid;
-  justify-items: end;
-  gap: 5px;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 6px;
+  width: 240px;
+  flex-shrink: 0;
 }
 
 .activity-link {
@@ -3617,10 +3633,21 @@ fieldset.file-filter-panel {
 
 .inline-log-row {
   display: flex;
-  align-items: flex-start;
-  gap: 6px;
+  align-items: center;
+  gap: 8px;
   line-height: 1.4;
   color: #e2e8f0;
+  min-width: 0;
+  width: 100%;
+}
+
+.log-text {
+  flex: 1 1 auto;
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  font-size: 11px;
 }
 
 .log-tag {

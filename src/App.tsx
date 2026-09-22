@@ -1654,188 +1654,191 @@ export default function App() {
                   runningIds.has(job.id) && job.status !== "running"
                     ? 0
                     : Math.max(0, Math.min(100, job.progress_percent ?? 0));
+                const isExpanded = isRunning && !collapsedLogJobIds.has(job.id);
+                const jobEntries = (inlineLogs[job.id] ?? []).filter(
+                  (e) => !isSpamHeartbeat(e),
+                );
+
                 return (
-                  <article className="job-card" key={job.id}>
-                    <button
-                      className="job-main"
-                      onClick={() => void showHistory(job)}
-                    >
-                      <span
-                        className={`status-dot ${
-                          isRunning ? "running" : job.status
-                        }`}
-                      />
-                      <div className="job-copy">
-                        <div className="job-title-row">
-                          <h3>{job.name}</h3>
-                          <span
-                            className={`status-pill ${
-                              isRunning ? "running" : job.status
-                            }`}
-                          >
-                            {isRunning ? "Running" : job.status}
-                          </span>
+                  <article
+                    className={`job-card ${isRunning ? "job-card-running" : ""}`}
+                    key={job.id}
+                  >
+                    <div className="job-card-header">
+                      <button
+                        className="job-main"
+                        onClick={() => void showHistory(job)}
+                      >
+                        <span
+                          className={`status-dot ${
+                            isRunning ? "running" : job.status
+                          }`}
+                        />
+                        <div className="job-copy">
+                          <div className="job-title-row">
+                            <h3>{job.name}</h3>
+                            <span
+                              className={`status-pill ${
+                                isRunning ? "running" : job.status
+                              }`}
+                            >
+                              {isRunning ? "Running" : job.status}
+                            </span>
+                          </div>
+                          <p title={job.source_paths.join("\n")}>
+                            {sourceSummary(job.source_paths)}
+                          </p>
+                          <div className="job-meta">
+                            <span>☁ {job.destination}</span>
+                            <span>▣ {backupModeLabel(job.backup_mode)}</span>
+                            <span>◷ {formatInterval(job.interval_minutes)}</span>
+                            <span>
+                              {job.last_run_at
+                                ? `Last run ${formatTime(job.last_run_at)}`
+                                : `Next run ${formatTime(job.next_run_at)}`}
+                            </span>
+                          </div>
                         </div>
-                        <p title={job.source_paths.join("\n")}>
-                          {sourceSummary(job.source_paths)}
-                        </p>
-                        <div className="job-meta">
-                          <span>☁ {job.destination}</span>
-                          <span>▣ {backupModeLabel(job.backup_mode)}</span>
-                          <span>◷ {formatInterval(job.interval_minutes)}</span>
-                          <span>
-                            {job.last_run_at
-                              ? `Last run ${formatTime(job.last_run_at)}`
-                              : `Next run ${formatTime(job.next_run_at)}`}
-                          </span>
+                      </button>
+
+                      <div className="job-actions">
+                        <label className="switch" title="Enable scheduled backup">
+                          <input
+                            type="checkbox"
+                            checked={job.enabled}
+                            disabled={isRunning}
+                            onChange={(event) =>
+                              void setEnabled(job, event.target.checked)
+                            }
+                          />
+                          <span />
+                        </label>
+                        {isRunning ? (
+                          <div className="running-job-controls">
+                            <div
+                              className="backup-progress clickable-progress"
+                              role="progressbar"
+                              aria-label={`Backing up ${job.name}`}
+                              aria-valuemin={0}
+                              aria-valuemax={100}
+                              aria-valuenow={progressPercent}
+                              onClick={() =>
+                                setCollapsedLogJobIds((curr) => {
+                                  const next = new Set(curr);
+                                  if (next.has(job.id)) next.delete(job.id);
+                                  else next.add(job.id);
+                                  return next;
+                                })
+                              }
+                              title={
+                                isExpanded
+                                  ? "Click to collapse live transfer log"
+                                  : "Click to expand live transfer log"
+                              }
+                            >
+                              <div className="backup-progress-copy">
+                                <small>
+                                  {job.progress_message ??
+                                    `Backing up ${job.name}`}
+                                </small>
+                                <div
+                                  style={{
+                                    display: "flex",
+                                    alignItems: "center",
+                                    gap: "6px",
+                                  }}
+                                >
+                                  <strong>{progressPercent}%</strong>
+                                  <span className="progress-expand-hint">
+                                    {isExpanded ? "▲ Hide" : "▼ Live Log"}
+                                  </span>
+                                </div>
+                              </div>
+                              <div className="backup-progress-track">
+                                <span
+                                  style={{ width: `${progressPercent}%` }}
+                                />
+                              </div>
+                            </div>
+                            <div className="running-job-links">
+                              <button
+                                className="activity-link"
+                                onClick={() => void openActivityLog(job)}
+                              >
+                                Full log
+                              </button>
+                              <button
+                                className="cancel-sync-link"
+                                disabled={cancellingIds.has(job.id)}
+                                onClick={() => void cancelJob(job)}
+                              >
+                                {cancellingIds.has(job.id)
+                                  ? "Stopping…"
+                                  : "Cancel"}
+                              </button>
+                            </div>
+                          </div>
+                        ) : (
+                          <button
+                            className="run-button"
+                            onClick={() => void runJob(job)}
+                          >
+                            Back up now
+                          </button>
+                        )}
+                      </div>
+                    </div>
+
+                    {isExpanded && (
+                      <div className="inline-log-drawer">
+                        <div className="inline-log-header">
+                          <span>Live Activity Feed</span>
+                          <div style={{ display: "flex", gap: "8px", alignItems: "center" }}>
+                            <button
+                              type="button"
+                              className="inline-log-clear-btn"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                void clearJobActivity(job.id);
+                              }}
+                              title="Clear live activity log for this backup"
+                            >
+                              Clear log
+                            </button>
+                            <small>Auto-scrolling</small>
+                          </div>
+                        </div>
+                        <div
+                          className="inline-log-body"
+                          ref={(el) => {
+                            if (el) el.scrollTop = el.scrollHeight;
+                          }}
+                        >
+                          {jobEntries.length === 0 ? (
+                            <div className="inline-log-empty">
+                              Waiting for transfer events…
+                            </div>
+                          ) : (
+                            jobEntries.slice(-30).map((entry) => (
+                              <div
+                                className="inline-log-row"
+                                key={entry.id}
+                                title={entry.message}
+                              >
+                                <span
+                                  className={`log-tag log-tag-${entry.state}`}
+                                >
+                                  {entry.state}
+                                </span>
+                                <span className="log-text">
+                                  {entry.message}
+                                </span>
+                              </div>
+                            ))
+                          )}
                         </div>
                       </div>
-                    </button>
-                    <div className="job-actions">
-                      <label className="switch" title="Enable scheduled backup">
-                        <input
-                          type="checkbox"
-                          checked={job.enabled}
-                          disabled={isRunning}
-                          onChange={(event) =>
-                            void setEnabled(job, event.target.checked)
-                          }
-                        />
-                        <span />
-                      </label>
-                      {isRunning ? (
-                        <div className="running-job-controls">
-                          {(() => {
-                            const isExpanded = !collapsedLogJobIds.has(job.id);
-                            const jobEntries = (inlineLogs[job.id] ?? []).filter(
-                              (e) => !isSpamHeartbeat(e),
-                            );
-                            return (
-                              <>
-                                <div
-                                  className="backup-progress clickable-progress"
-                                  role="progressbar"
-                                  aria-label={`Backing up ${job.name}`}
-                                  aria-valuemin={0}
-                                  aria-valuemax={100}
-                                  aria-valuenow={progressPercent}
-                                  onClick={() =>
-                                    setCollapsedLogJobIds((curr) => {
-                                      const next = new Set(curr);
-                                      if (next.has(job.id)) next.delete(job.id);
-                                      else next.add(job.id);
-                                      return next;
-                                    })
-                                  }
-                                  title={
-                                    isExpanded
-                                      ? "Click to collapse live transfer log"
-                                      : "Click to expand live transfer log"
-                                  }
-                                >
-                                  <div className="backup-progress-copy">
-                                    <small>
-                                      {job.progress_message ??
-                                        `Backing up ${job.name}`}
-                                    </small>
-                                    <div
-                                      style={{
-                                        display: "flex",
-                                        alignItems: "center",
-                                        gap: "6px",
-                                      }}
-                                    >
-                                      <strong>{progressPercent}%</strong>
-                                      <span className="progress-expand-hint">
-                                        {isExpanded ? "▲ Hide" : "▼ Live Log"}
-                                      </span>
-                                    </div>
-                                  </div>
-                                  <div className="backup-progress-track">
-                                    <span
-                                      style={{ width: `${progressPercent}%` }}
-                                    />
-                                  </div>
-                                </div>
-                                <div className="running-job-links">
-                                  <button
-                                    className="activity-link"
-                                    onClick={() => void openActivityLog(job)}
-                                  >
-                                    Full log
-                                  </button>
-                                  <button
-                                    className="cancel-sync-link"
-                                    disabled={cancellingIds.has(job.id)}
-                                    onClick={() => void cancelJob(job)}
-                                  >
-                                    {cancellingIds.has(job.id)
-                                      ? "Stopping…"
-                                      : "Cancel"}
-                                  </button>
-                                </div>
-                                {isExpanded && (
-                                  <div className="inline-log-drawer">
-                                    <div className="inline-log-header">
-                                      <span>Live Activity Feed</span>
-                                      <div style={{ display: "flex", gap: "8px", alignItems: "center" }}>
-                                        <button
-                                          type="button"
-                                          className="inline-log-clear-btn"
-                                          onClick={(e) => {
-                                            e.stopPropagation();
-                                            void clearJobActivity(job.id);
-                                          }}
-                                          title="Clear live activity log for this backup"
-                                        >
-                                          Clear log
-                                        </button>
-                                        <small>Auto-scrolling</small>
-                                      </div>
-                                    </div>
-                                    <div
-                                      className="inline-log-body"
-                                      ref={(el) => {
-                                        if (el) el.scrollTop = el.scrollHeight;
-                                      }}
-                                    >
-                                      {jobEntries.length === 0 ? (
-                                        <div className="inline-log-empty">
-                                          Waiting for transfer events…
-                                        </div>
-                                      ) : (
-                                        jobEntries.slice(-16).map((entry) => (
-                                          <div
-                                            className="inline-log-row"
-                                            key={entry.id}
-                                          >
-                                            <span
-                                              className={`log-tag log-tag-${entry.state}`}
-                                            >
-                                              {entry.state}
-                                            </span>
-                                            <span className="log-text">
-                                              {entry.message}
-                                            </span>
-                                          </div>
-                                        ))
-                                      )}
-                                    </div>
-                                  </div>
-                                )}
-                              </>
-                            );
-                          })()}
-                        </div>
-                      ) : (
-                        <button
-                          className="run-button"
-                          onClick={() => void runJob(job)}
-                        >
-                          Back up now
-                        </button>
-                      )}
-                    </div>
+                    )}
                   </article>
                 );
               })}

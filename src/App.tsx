@@ -2655,35 +2655,34 @@ export default function App() {
 
                 <div className="form-grid-2col">
                   <div className="field-block">
-                    <label>
-                      <span className="field-label-text">Google Account</span>
-                      <select
-                        value={draft.remote}
-                        required
-                        onChange={(event) =>
-                          setDraft({
-                            ...draft,
-                            remote: event.target.value,
-                            cloud_path: null,
-                          })
-                        }
-                      >
-                        <option value="" disabled>
-                          Choose an account
+                    <span className="field-label-text">Google Account</span>
+                    <select
+                      className="form-select-control"
+                      value={draft.remote}
+                      required
+                      onChange={(event) =>
+                        setDraft({
+                          ...draft,
+                          remote: event.target.value,
+                          cloud_path: null,
+                        })
+                      }
+                    >
+                      <option value="" disabled>
+                        Choose an account
+                      </option>
+                      {draft.remote &&
+                        !remotes.some((remote) => remote.name === draft.remote) && (
+                        <option value={draft.remote}>
+                          {draft.remote.replace(/:$/, "")}
                         </option>
-                        {draft.remote &&
-                          !remotes.some((remote) => remote.name === draft.remote) && (
-                          <option value={draft.remote}>
-                            {draft.remote.replace(/:$/, "")}
-                          </option>
-                        )}
-                        {remotes.map((remote) => (
-                          <option value={remote.name} key={remote.name}>
-                            {remote.label}
-                          </option>
-                        ))}
-                      </select>
-                    </label>
+                      )}
+                      {remotes.map((remote) => (
+                        <option value={remote.name} key={remote.name}>
+                          {remote.label}
+                        </option>
+                      ))}
+                    </select>
                   </div>
 
                   <div className="field-block">
@@ -2703,7 +2702,7 @@ export default function App() {
                         </strong>
                         <small>Click to browse Google Drive</small>
                       </span>
-                      <b aria-hidden="true">›</b>
+                      <b className="folder-arrow" aria-hidden="true">›</b>
                     </button>
                   </div>
                 </div>
@@ -2718,74 +2717,75 @@ export default function App() {
                   </button>
                 )}
 
-                <div className="schedule-config-section">
-                  <div className="field-block" style={{ flex: 1 }}>
+                <div className="field-block schedule-block">
+                  <div className="field-label-row">
                     <span className="field-label-text">Run Frequency</span>
-                    {!showAdvancedSchedule ? (
-                      <select
-                        aria-label="Backup schedule"
-                        value={draft.interval_minutes}
-                        onChange={(event) =>
-                          setDraft({
-                            ...draft,
-                            interval_minutes: Number(event.target.value),
-                          })
-                        }
-                      >
-                        <option value={15}>Every 15 minutes</option>
-                        <option value={30}>Every 30 minutes</option>
-                        <option value={60}>Every hour</option>
-                        <option value={180}>Every 3 hours</option>
-                        <option value={360}>Every 6 hours</option>
-                        <option value={720}>Every 12 hours</option>
-                        <option value={1440}>Every day</option>
-                      </select>
-                    ) : (
-                      <div className="advanced-schedule">
-                        <div className="advanced-schedule-row">
-                          <span>Run every</span>
-                          <input
-                            aria-label="Custom schedule amount"
-                            type="number"
-                            min={1}
-                            max={
-                              customIntervalUnit === "days"
-                                ? 30
-                                : customIntervalUnit === "hours"
-                                  ? 168
-                                  : 10080
-                            }
-                            value={customInterval}
-                            onChange={(event) =>
-                              setAdvancedInterval(Number(event.target.value))
-                            }
-                          />
-                          <select
-                            aria-label="Custom schedule unit"
-                            value={customIntervalUnit}
-                            onChange={(event) =>
-                              setAdvancedIntervalUnit(
-                                event.target.value as IntervalUnit,
-                              )
-                            }
-                          >
-                            <option value="minutes">minutes</option>
-                            <option value="hours">hours</option>
-                            <option value="days">days</option>
-                          </select>
-                        </div>
-                      </div>
-                    )}
+                    <button
+                      type="button"
+                      className="schedule-toggle-link"
+                      onClick={toggleAdvancedSchedule}
+                    >
+                      {showAdvancedSchedule
+                        ? "← Simple schedule choices"
+                        : "More schedule options"}
+                    </button>
                   </div>
-                  <button
-                    type="button"
-                    className="advanced-schedule-toggle"
-                    onClick={toggleAdvancedSchedule}
-                  >
-                    {showAdvancedSchedule
-                      ? "Use simple schedule choices"
-                      : "More schedule options"}
-                  </button>
+                  {!showAdvancedSchedule ? (
+                    <select
+                      className="form-select-control schedule-select"
+                      aria-label="Backup schedule"
+                      value={draft.interval_minutes}
+                      onChange={(event) =>
+                        setDraft({
+                          ...draft,
+                          interval_minutes: Number(event.target.value),
+                        })
+                      }
+                    >
+                      <option value={15}>Every 15 minutes</option>
+                      <option value={30}>Every 30 minutes</option>
+                      <option value={60}>Every hour</option>
+                      <option value={180}>Every 3 hours</option>
+                      <option value={360}>Every 6 hours</option>
+                      <option value={720}>Every 12 hours</option>
+                      <option value={1440}>Every day</option>
+                    </select>
+                  ) : (
+                    <div className="advanced-schedule">
+                      <div className="advanced-schedule-row">
+                        <span>Run every</span>
+                        <input
+                          aria-label="Custom schedule amount"
+                          type="number"
+                          min={1}
+                          max={
+                            customIntervalUnit === "days"
+                              ? 30
+                              : customIntervalUnit === "hours"
+                                ? 168
+                                : 10080
+                          }
+                          value={customInterval}
+                          onChange={(event) =>
+                            setAdvancedInterval(Number(event.target.value))
+                          }
+                        />
+                        <select
+                          aria-label="Custom schedule unit"
+                          value={customIntervalUnit}
+                          onChange={(event) =>
+                            setAdvancedIntervalUnit(
+                              event.target.value as IntervalUnit,
+                            )
+                          }
+                        >
+                          <option value="minutes">minutes</option>
+                          <option value="hours">hours</option>
+                          <option value="days">days</option>
+                        </select>
+                      </div>
+                    </div>
+                  )}
                 </div>
               </div>
 
@@ -2807,23 +2807,27 @@ export default function App() {
                       "incremental",
                       "Incremental",
                       "Safely upload only new and changed files. (Recommended)",
+                      "＋",
                     ],
                     [
                       "full",
                       "Full backup",
                       "Save a new dated copy of everything each time.",
+                      "▦",
                     ],
                     [
                       "differential",
                       "Differential backup",
                       "Keep a full baseline, then dated changes since it.",
+                      "◫",
                     ],
                     [
                       "mirror",
                       "Mirroring",
                       "Make a cloud folder exactly match a local folder.",
+                      "⇄",
                     ],
-                  ] as const).map(([mode, title, description]) => (
+                  ] as const).map(([mode, title, description, icon]) => (
                     <label
                       className={`backup-mode-card ${
                         draft.backup_mode === mode ? "selected" : ""
@@ -2840,16 +2844,10 @@ export default function App() {
                           if (mode !== "mirror") setMirrorAcknowledged(false);
                         }}
                       />
-                      <span aria-hidden="true">
-                        {mode === "full"
-                          ? "▦"
-                          : mode === "incremental"
-                            ? "＋"
-                            : mode === "differential"
-                              ? "◫"
-                              : "⇄"}
-                      </span>
-                      <strong>{title}</strong>
+                      <div className="mode-card-header-row">
+                        <span className="mode-glyph" aria-hidden="true">{icon}</span>
+                        <strong>{title}</strong>
+                      </div>
                       <small>{description}</small>
                     </label>
                   ))}
@@ -2895,9 +2893,9 @@ export default function App() {
                       </span>
                     </label>
                     {draft.retention_count > 0 && (
-                      <div className="retention-count">
-                        <label>
-                          Keep the last
+                      <div className="retention-count-section">
+                        <div className="retention-stepper-row">
+                          <span>Keep the last</span>
                           <input
                             aria-label="Number of previous backups to keep"
                             type="number"
@@ -2914,9 +2912,9 @@ export default function App() {
                               })
                             }
                           />
-                          backup runs
-                        </label>
-                        <p>
+                          <span>backup runs</span>
+                        </div>
+                        <p className="retention-helper-text">
                           Older safety copies are removed automatically. The live
                           backup is never counted.
                         </p>

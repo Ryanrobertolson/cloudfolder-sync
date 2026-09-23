@@ -342,7 +342,7 @@ dependencies = [
 
 [[package]]
 name = "cloudfolder-sync"
-version = "0.9.10"
+version = "0.9.11"
 dependencies = [
  "chrono",
  "reqwest 0.12.28",

@@ -12,8 +12,7 @@ on:
       - src-tauri/tauri.conf.json
   workflow_dispatch:
 
-permissions:
-  contents: write
+permissions: {}
 
 concurrency:
   group: cloudfolder-release
@@ -23,6 +22,9 @@ jobs:
   release:
     name: Build and publish Ubuntu release
     runs-on: ubuntu-24.04
+
+    permissions:
+      contents: write
 
     steps:
       - name: Check out the release commit

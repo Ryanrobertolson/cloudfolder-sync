@@ -2483,7 +2483,7 @@ export default function App() {
       {showCreate && (
         <div className="modal-backdrop" onMouseDown={closeJobForm}>
           <section
-            className="modal"
+            className="modal job-form-modal"
             role="dialog"
             aria-modal="true"
             aria-labelledby="create-title"
@@ -2492,53 +2492,73 @@ export default function App() {
             <button className="modal-close" onClick={closeJobForm}>
               ×
             </button>
-            <p className="eyebrow">
-              {editingJob ? "Edit scheduled backup" : "New scheduled backup"}
-            </p>
-            <h2 id="create-title">
-              {editingJob ? "Update this backup" : "Protect something important"}
-            </h2>
-            <p className="modal-intro">
-              {editingJob
-                ? "Change what is backed up, where it goes, or how often it runs."
-                : "Choose a safe backup type below. CloudFolder warns before any option can delete cloud files."}
-            </p>
+            <div className="job-form-header">
+              <p className="eyebrow">
+                {editingJob ? "Edit scheduled backup" : "New scheduled backup"}
+              </p>
+              <h2 id="create-title">
+                {editingJob ? "Update backup configuration" : "Protect something important"}
+              </h2>
+              <p className="modal-intro">
+                {editingJob
+                  ? "Change what is backed up, where it goes, or how often it runs."
+                  : "Configure your source folders, destination, and automated sync rules."}
+              </p>
+            </div>
 
-            <form onSubmit={saveJob}>
-              <label>
-                Backup name
-                <input
-                  value={draft.name}
-                  required
-                  placeholder="Work documents"
-                  onChange={(event) =>
-                    setDraft({ ...draft, name: event.target.value })
-                  }
-                />
-              </label>
+            <form onSubmit={saveJob} className="job-editor-form">
+              {/* Card 1: Backup Name */}
+              <div className="form-card">
+                <label className="form-card-label">
+                  <span className="form-card-title">Backup Name</span>
+                  <input
+                    value={draft.name}
+                    required
+                    placeholder="e.g. Work Documents, Linux Sync..."
+                    onChange={(event) =>
+                      setDraft({ ...draft, name: event.target.value })
+                    }
+                  />
+                </label>
+              </div>
 
-              <fieldset>
-                <legend>What should be backed up?</legend>
-                <div className="source-picker multi-source-picker">
-                  <div>
-                    <strong>{sourceSummary(draft.source_paths)}</strong>
-                    <small>Add as many as you need, up to 50</small>
+              {/* Card 2: What should be backed up? */}
+              <div className="form-card">
+                <div className="form-card-header">
+                  <div className="card-header-left">
+                    <span className="card-icon">📁</span>
+                    <div>
+                      <strong>Source Folders & Files</strong>
+                      <small>{sourceSummary(draft.source_paths)} (up to 50)</small>
+                    </div>
                   </div>
-                  <button type="button" onClick={() => void chooseSource(false)}>
-                    ＋ Add files
-                  </button>
-                  <button type="button" onClick={() => void chooseSource(true)}>
-                    ＋ Add folders
-                  </button>
+                  <div className="source-picker-actions">
+                    <button
+                      type="button"
+                      className="btn-add-source"
+                      onClick={() => void chooseSource(false)}
+                    >
+                      ＋ Add files
+                    </button>
+                    <button
+                      type="button"
+                      className="btn-add-source primary-source"
+                      onClick={() => void chooseSource(true)}
+                    >
+                      ＋ Add folders
+                    </button>
+                  </div>
                 </div>
-                {draft.source_paths.length > 0 && (
+
+                {draft.source_paths.length > 0 ? (
                   <div className="selected-source-list">
                     {draft.source_paths.map((path) => (
-                      <div key={path}>
-                        <span aria-hidden="true">▰</span>
+                      <div className="source-item-chip" key={path}>
+                        <span className="source-item-icon">📂</span>
                         <strong title={path}>{shortPath(path)}</strong>
                         <button
                           type="button"
+                          className="source-item-remove"
                           aria-label={`Remove ${path}`}
                           onClick={() => removeSource(path)}
                         >
@@ -2547,13 +2567,20 @@ export default function App() {
                       </div>
                     ))}
                   </div>
+                ) : (
+                  <div className="empty-sources-notice">
+                    <span>📂</span>
+                    <p>No sources selected. Click "＋ Add folders" or "＋ Add files" above.</p>
+                  </div>
                 )}
+
                 {draft.source_paths.length > 1 && (
                   <p className="multi-source-note">
                     Each item gets its own named folder in Google Drive, so files
                     cannot overwrite each other.
                   </p>
                 )}
+
                 {scanningLargeFiles && (
                   <p className="scan-status">Checking for files over 25 MiB…</p>
                 )}
@@ -2612,10 +2639,314 @@ export default function App() {
                       </div>
                     </div>
                   )}
-              </fieldset>
+              </div>
 
-              <fieldset className="ignore-fieldset">
-                <legend>Make this backup faster</legend>
+              {/* Card 3: Cloud Destination & Schedule */}
+              <div className="form-card">
+                <div className="form-card-header">
+                  <div className="card-header-left">
+                    <span className="card-icon">☁️</span>
+                    <div>
+                      <strong>Destination & Schedule</strong>
+                      <small>Google Drive target account and automated interval</small>
+                    </div>
+                  </div>
+                </div>
+
+                <div className="form-grid-2col">
+                  <div className="field-block">
+                    <label>
+                      <span className="field-label-text">Google Account</span>
+                      <select
+                        value={draft.remote}
+                        required
+                        onChange={(event) =>
+                          setDraft({
+                            ...draft,
+                            remote: event.target.value,
+                            cloud_path: null,
+                          })
+                        }
+                      >
+                        <option value="" disabled>
+                          Choose an account
+                        </option>
+                        {draft.remote &&
+                          !remotes.some((remote) => remote.name === draft.remote) && (
+                          <option value={draft.remote}>
+                            {draft.remote.replace(/:$/, "")}
+                          </option>
+                        )}
+                        {remotes.map((remote) => (
+                          <option value={remote.name} key={remote.name}>
+                            {remote.label}
+                          </option>
+                        ))}
+                      </select>
+                    </label>
+                  </div>
+
+                  <div className="field-block">
+                    <span className="field-label-text">Google Drive Folder</span>
+                    <button
+                      type="button"
+                      className="cloud-folder-field"
+                      disabled={!draft.remote}
+                      onClick={openFolderBrowser}
+                    >
+                      <span className="folder-glyph" aria-hidden="true">📁</span>
+                      <span className="folder-meta">
+                        <strong>
+                          {draft.cloud_path === null
+                            ? "Choose a folder"
+                            : draft.cloud_path || "My Drive"}
+                        </strong>
+                        <small>Click to browse Google Drive</small>
+                      </span>
+                      <b aria-hidden="true">›</b>
+                    </button>
+                  </div>
+                </div>
+
+                {remotes.length === 0 && (
+                  <button
+                    type="button"
+                    className="inline-setup"
+                    onClick={() => configureCloud()}
+                  >
+                    Add Google Drive first
+                  </button>
+                )}
+
+                <div className="schedule-config-section">
+                  <div className="field-block" style={{ flex: 1 }}>
+                    <span className="field-label-text">Run Frequency</span>
+                    {!showAdvancedSchedule ? (
+                      <select
+                        aria-label="Backup schedule"
+                        value={draft.interval_minutes}
+                        onChange={(event) =>
+                          setDraft({
+                            ...draft,
+                            interval_minutes: Number(event.target.value),
+                          })
+                        }
+                      >
+                        <option value={15}>Every 15 minutes</option>
+                        <option value={30}>Every 30 minutes</option>
+                        <option value={60}>Every hour</option>
+                        <option value={180}>Every 3 hours</option>
+                        <option value={360}>Every 6 hours</option>
+                        <option value={720}>Every 12 hours</option>
+                        <option value={1440}>Every day</option>
+                      </select>
+                    ) : (
+                      <div className="advanced-schedule">
+                        <div className="advanced-schedule-row">
+                          <span>Run every</span>
+                          <input
+                            aria-label="Custom schedule amount"
+                            type="number"
+                            min={1}
+                            max={
+                              customIntervalUnit === "days"
+                                ? 30
+                                : customIntervalUnit === "hours"
+                                  ? 168
+                                  : 10080
+                            }
+                            value={customInterval}
+                            onChange={(event) =>
+                              setAdvancedInterval(Number(event.target.value))
+                            }
+                          />
+                          <select
+                            aria-label="Custom schedule unit"
+                            value={customIntervalUnit}
+                            onChange={(event) =>
+                              setAdvancedIntervalUnit(
+                                event.target.value as IntervalUnit,
+                              )
+                            }
+                          >
+                            <option value="minutes">minutes</option>
+                            <option value="hours">hours</option>
+                            <option value="days">days</option>
+                          </select>
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                  <button
+                    type="button"
+                    className="advanced-schedule-toggle"
+                    onClick={toggleAdvancedSchedule}
+                  >
+                    {showAdvancedSchedule
+                      ? "Use simple schedule choices"
+                      : "More schedule options"}
+                  </button>
+                </div>
+              </div>
+
+              {/* Card 4: Backup Mode & Safety History */}
+              <div className="form-card">
+                <div className="form-card-header">
+                  <div className="card-header-left">
+                    <span className="card-icon">⚡</span>
+                    <div>
+                      <strong>Backup Type & History</strong>
+                      <small>Choose how files are uploaded and retained in the cloud</small>
+                    </div>
+                  </div>
+                </div>
+
+                <div className="backup-mode-grid">
+                  {([
+                    [
+                      "incremental",
+                      "Incremental",
+                      "Safely upload only new and changed files. (Recommended)",
+                    ],
+                    [
+                      "full",
+                      "Full backup",
+                      "Save a new dated copy of everything each time.",
+                    ],
+                    [
+                      "differential",
+                      "Differential backup",
+                      "Keep a full baseline, then dated changes since it.",
+                    ],
+                    [
+                      "mirror",
+                      "Mirroring",
+                      "Make a cloud folder exactly match a local folder.",
+                    ],
+                  ] as const).map(([mode, title, description]) => (
+                    <label
+                      className={`backup-mode-card ${
+                        draft.backup_mode === mode ? "selected" : ""
+                      } ${mode === "mirror" ? "destructive" : ""}`}
+                      key={mode}
+                    >
+                      <input
+                        type="radio"
+                        name="backup-mode"
+                        value={mode}
+                        checked={draft.backup_mode === mode}
+                        onChange={() => {
+                          setDraft({ ...draft, backup_mode: mode });
+                          if (mode !== "mirror") setMirrorAcknowledged(false);
+                        }}
+                      />
+                      <span aria-hidden="true">
+                        {mode === "full"
+                          ? "▦"
+                          : mode === "incremental"
+                            ? "＋"
+                            : mode === "differential"
+                              ? "◫"
+                              : "⇄"}
+                      </span>
+                      <strong>{title}</strong>
+                      <small>{description}</small>
+                    </label>
+                  ))}
+                </div>
+
+                {draft.backup_mode === "mirror" && (
+                  <label className="mirror-warning">
+                    <input
+                      type="checkbox"
+                      checked={mirrorAcknowledged}
+                      onChange={(event) =>
+                        setMirrorAcknowledged(event.target.checked)
+                      }
+                    />
+                    <span>
+                      <strong>Mirroring can delete cloud files.</strong>
+                      I understand that cloud files missing from this computer
+                      will be removed from the selected destination. Mirroring
+                      works with folders, not individual files.
+                    </span>
+                  </label>
+                )}
+
+                {draft.backup_mode === "incremental" ||
+                draft.backup_mode === "mirror" ? (
+                  <div className="retention-inline-block">
+                    <label className="retention-toggle">
+                      <input
+                        type="checkbox"
+                        checked={draft.retention_count > 0}
+                        onChange={(event) =>
+                          setDraft({
+                            ...draft,
+                            retention_count: event.target.checked ? 5 : 0,
+                          })
+                        }
+                      />
+                      <span>
+                        <strong>Keep a safety copy when a file changes</strong>
+                        <small>
+                          Changed or deleted cloud files can be restored later.
+                        </small>
+                      </span>
+                    </label>
+                    {draft.retention_count > 0 && (
+                      <div className="retention-count">
+                        <label>
+                          Keep the last
+                          <input
+                            aria-label="Number of previous backups to keep"
+                            type="number"
+                            min={1}
+                            max={50}
+                            value={draft.retention_count}
+                            onChange={(event) =>
+                              setDraft({
+                                ...draft,
+                                retention_count: Math.max(
+                                  1,
+                                  Math.min(50, Number(event.target.value) || 1),
+                                ),
+                              })
+                            }
+                          />
+                          backup runs
+                        </label>
+                        <p>
+                          Older safety copies are removed automatically. The live
+                          backup is never counted.
+                        </p>
+                      </div>
+                    )}
+                  </div>
+                ) : (
+                  <div className="dated-copy-note">
+                    <span aria-hidden="true">ℹ️</span>
+                    <p>
+                      <strong>This backup type already keeps dated copies.</strong>
+                      Full and differential backups place older files in dated
+                      cloud folders.
+                    </p>
+                  </div>
+                )}
+              </div>
+
+              {/* Card 5: Speed & File Filters */}
+              <div className="form-card">
+                <div className="form-card-header">
+                  <div className="card-header-left">
+                    <span className="card-icon">🛡️</span>
+                    <div>
+                      <strong>Speed & File Filters</strong>
+                      <small>Skip build caches, large files, and specific formats</small>
+                    </div>
+                  </div>
+                </div>
+
                 <label className="ignore-preset">
                   <input
                     type="checkbox"
@@ -2628,69 +2959,13 @@ export default function App() {
                     ⚡
                   </span>
                   <span>
-                    <strong>Skip files that coding tools can rebuild</strong>
+                    <strong>Skip files that coding tools can rebuild (Recommended)</strong>
                     <small>
                       Do not upload target, node_modules, or .git folders. Your
                       source code and personal files are still backed up.
                     </small>
                   </span>
                 </label>
-
-                <details className="custom-ignore-rules">
-                  <summary>Add your own skip rule</summary>
-                  <p>
-                    Use <code>**/folder-name/**</code> to skip a folder wherever
-                    it appears.
-                  </p>
-                  <div className="ignore-rule-input">
-                    <input
-                      aria-label="Custom ignore rule"
-                      value={ignorePatternInput}
-                      maxLength={512}
-                      placeholder="**/folder-name/**"
-                      onChange={(event) =>
-                        setIgnorePatternInput(event.target.value)
-                      }
-                      onKeyDown={(event) => {
-                        if (event.key === "Enter") {
-                          event.preventDefault();
-                          addIgnorePattern();
-                        }
-                      }}
-                    />
-                    <button
-                      type="button"
-                      disabled={!ignorePatternInput.trim()}
-                      onClick={addIgnorePattern}
-                    >
-                      Add rule
-                    </button>
-                  </div>
-                </details>
-
-                {draft.exclude_patterns.length > 0 && (
-                  <div className="ignore-rule-list">
-                    <strong>
-                      {draft.exclude_patterns.length} active ignore rule
-                      {draft.exclude_patterns.length === 1 ? "" : "s"}
-                    </strong>
-                    <div>
-                      {draft.exclude_patterns.map((pattern) => (
-                        <span key={pattern}>
-                          <code>{pattern}</code>
-                          <button
-                            type="button"
-                            aria-label={`Remove ignore rule ${pattern}`}
-                            onClick={() => removeIgnorePattern(pattern)}
-                          >
-                            ×
-                          </button>
-                        </span>
-                      ))}
-                    </div>
-                    <small>These files stay on this computer.</small>
-                  </div>
-                )}
 
                 <div className="file-filter-grid">
                   <section className="file-filter-panel">
@@ -2855,282 +3130,61 @@ export default function App() {
                     )}
                   </section>
                 </div>
-              </fieldset>
 
-              <div className="form-row">
-                <label>
-                  Google account
-                  <select
-                    value={draft.remote}
-                    required
-                    onChange={(event) =>
-                      setDraft({
-                        ...draft,
-                        remote: event.target.value,
-                        cloud_path: null,
-                      })
-                    }
-                  >
-                    <option value="" disabled>
-                      Choose an account
-                    </option>
-                    {draft.remote &&
-                      !remotes.some((remote) => remote.name === draft.remote) && (
-                      <option value={draft.remote}>
-                        {draft.remote.replace(/:$/, "")}
-                      </option>
-                    )}
-                    {remotes.map((remote) => (
-                      <option value={remote.name} key={remote.name}>
-                        {remote.label}
-                      </option>
-                    ))}
-                  </select>
-                </label>
-                <div className="field-group">
-                  <span className="field-label">Google Drive folder</span>
-                  <button
-                    type="button"
-                    className="cloud-folder-field"
-                    disabled={!draft.remote}
-                    onClick={openFolderBrowser}
-                  >
-                    <span className="folder-glyph" aria-hidden="true">▰</span>
-                    <span>
-                      <strong>
-                        {draft.cloud_path === null
-                          ? "Choose a folder"
-                          : draft.cloud_path || "My Drive"}
-                      </strong>
-                      <small>Click to browse Google Drive</small>
-                    </span>
-                    <b aria-hidden="true">›</b>
-                  </button>
-                </div>
-              </div>
-
-              {remotes.length === 0 && (
-                <button
-                  type="button"
-                  className="inline-setup"
-                  onClick={() => configureCloud()}
-                >
-                  Add Google Drive first
-                </button>
-              )}
-
-              <fieldset className="backup-mode-fieldset">
-                <legend>Backup type</legend>
-                <div className="backup-mode-grid">
-                  {([
-                    [
-                      "full",
-                      "Full backup",
-                      "Save a new dated copy of everything each time.",
-                    ],
-                    [
-                      "incremental",
-                      "Incremental backup",
-                      "Safely upload only new and changed files.",
-                    ],
-                    [
-                      "differential",
-                      "Differential backup",
-                      "Keep a full baseline, then dated changes since it.",
-                    ],
-                    [
-                      "mirror",
-                      "Mirroring",
-                      "Make a cloud folder exactly match a local folder.",
-                    ],
-                  ] as const).map(([mode, title, description]) => (
-                    <label
-                      className={`backup-mode-card ${
-                        draft.backup_mode === mode ? "selected" : ""
-                      } ${mode === "mirror" ? "destructive" : ""}`}
-                      key={mode}
+                <details className="custom-ignore-rules">
+                  <summary>Add custom ignore pattern</summary>
+                  <p>
+                    Use <code>**/folder-name/**</code> to skip a folder wherever
+                    it appears.
+                  </p>
+                  <div className="ignore-rule-input">
+                    <input
+                      aria-label="Custom ignore rule"
+                      value={ignorePatternInput}
+                      maxLength={512}
+                      placeholder="**/folder-name/**"
+                      onChange={(event) =>
+                        setIgnorePatternInput(event.target.value)
+                      }
+                      onKeyDown={(event) => {
+                        if (event.key === "Enter") {
+                          event.preventDefault();
+                          addIgnorePattern();
+                        }
+                      }}
+                    />
+                    <button
+                      type="button"
+                      disabled={!ignorePatternInput.trim()}
+                      onClick={addIgnorePattern}
                     >
-                      <input
-                        type="radio"
-                        name="backup-mode"
-                        value={mode}
-                        checked={draft.backup_mode === mode}
-                        onChange={() => {
-                          setDraft({ ...draft, backup_mode: mode });
-                          if (mode !== "mirror") setMirrorAcknowledged(false);
-                        }}
-                      />
-                      <span aria-hidden="true">
-                        {mode === "full"
-                          ? "▣"
-                          : mode === "incremental"
-                            ? "＋"
-                            : mode === "differential"
-                              ? "◫"
-                              : "⇄"}
-                      </span>
-                      <strong>{title}</strong>
-                      <small>{description}</small>
-                    </label>
-                  ))}
-                </div>
-                {draft.backup_mode === "mirror" && (
-                  <label className="mirror-warning">
-                    <input
-                      type="checkbox"
-                      checked={mirrorAcknowledged}
-                      onChange={(event) =>
-                        setMirrorAcknowledged(event.target.checked)
-                      }
-                    />
-                    <span>
-                      <strong>Mirroring can delete cloud files.</strong>
-                      I understand that cloud files missing from this computer
-                      will be removed from the selected destination. Mirroring
-                      works with folders, not individual files.
-                    </span>
-                  </label>
-                )}
-              </fieldset>
-
-              {draft.backup_mode === "incremental" ||
-              draft.backup_mode === "mirror" ? (
-                <fieldset className="retention-fieldset">
-                  <legend>Previous files</legend>
-                  <label className="retention-toggle">
-                    <input
-                      type="checkbox"
-                      checked={draft.retention_count > 0}
-                      onChange={(event) =>
-                        setDraft({
-                          ...draft,
-                          retention_count: event.target.checked ? 5 : 0,
-                        })
-                      }
-                    />
-                    <span>
-                      <strong>Keep a safety copy when a file changes</strong>
-                      <small>
-                        Changed or deleted cloud files can be restored later.
-                      </small>
-                    </span>
-                  </label>
-                  {draft.retention_count > 0 && (
-                    <div className="retention-count">
-                      <label>
-                        Keep the last
-                        <input
-                          aria-label="Number of previous backups to keep"
-                          type="number"
-                          min={1}
-                          max={50}
-                          value={draft.retention_count}
-                          onChange={(event) =>
-                            setDraft({
-                              ...draft,
-                              retention_count: Math.max(
-                                1,
-                                Math.min(50, Number(event.target.value) || 1),
-                              ),
-                            })
-                          }
-                        />
-                        backup runs
-                      </label>
-                      <p>
-                        Older safety copies are removed automatically. The live
-                        backup is never counted.
-                      </p>
+                      Add rule
+                    </button>
+                  </div>
+                  {draft.exclude_patterns.length > 0 && (
+                    <div className="ignore-rule-list">
+                      <strong>
+                        {draft.exclude_patterns.length} active ignore rule
+                        {draft.exclude_patterns.length === 1 ? "" : "s"}
+                      </strong>
+                      <div>
+                        {draft.exclude_patterns.map((pattern) => (
+                          <span key={pattern}>
+                            <code>{pattern}</code>
+                            <button
+                              type="button"
+                              aria-label={`Remove ignore rule ${pattern}`}
+                              onClick={() => removeIgnorePattern(pattern)}
+                            >
+                              ×
+                            </button>
+                          </span>
+                        ))}
+                      </div>
                     </div>
                   )}
-                </fieldset>
-              ) : (
-                <div className="dated-copy-note">
-                  <span aria-hidden="true">◷</span>
-                  <p>
-                    <strong>This backup type already keeps dated copies.</strong>
-                    Full and differential backups place older files in dated
-                    cloud folders.
-                  </p>
-                </div>
-              )}
-
-              <fieldset className="schedule-fieldset">
-                <legend>Run automatically</legend>
-                {!showAdvancedSchedule ? (
-                  <select
-                    aria-label="Backup schedule"
-                    value={draft.interval_minutes}
-                    onChange={(event) =>
-                      setDraft({
-                        ...draft,
-                        interval_minutes: Number(event.target.value),
-                      })
-                    }
-                  >
-                    <option value={15}>Every 15 minutes</option>
-                    <option value={30}>Every 30 minutes</option>
-                    <option value={60}>Every hour</option>
-                    <option value={180}>Every 3 hours</option>
-                    <option value={360}>Every 6 hours</option>
-                    <option value={720}>Every 12 hours</option>
-                    <option value={1440}>Every day</option>
-                  </select>
-                ) : (
-                  <div className="advanced-schedule">
-                    <div className="advanced-schedule-row">
-                      <span>Run every</span>
-                      <input
-                        aria-label="Custom schedule amount"
-                        type="number"
-                        min={1}
-                        max={
-                          customIntervalUnit === "days"
-                            ? 30
-                            : customIntervalUnit === "hours"
-                              ? 168
-                              : 10080
-                        }
-                        value={customInterval}
-                        onChange={(event) =>
-                          setAdvancedInterval(Number(event.target.value))
-                        }
-                      />
-                      <select
-                        aria-label="Custom schedule unit"
-                        value={customIntervalUnit}
-                        onChange={(event) =>
-                          setAdvancedIntervalUnit(
-                            event.target.value as IntervalUnit,
-                          )
-                        }
-                      >
-                        <option value="minutes">minutes</option>
-                        <option value="hours">hours</option>
-                        <option value="days">days</option>
-                      </select>
-                    </div>
-                    <div className="schedule-summary">
-                      <span aria-hidden="true">◷</span>
-                      <p>
-                        <strong>{formatInterval(draft.interval_minutes)}</strong>
-                        <small>
-                          The next backup is scheduled after each run finishes.
-                        </small>
-                      </p>
-                    </div>
-                  </div>
-                )}
-                <button
-                  type="button"
-                  className="advanced-schedule-toggle"
-                  onClick={toggleAdvancedSchedule}
-                >
-                  {showAdvancedSchedule
-                    ? "Use simple schedule choices"
-                    : "More schedule options"}
-                </button>
-              </fieldset>
+                </details>
+              </div>
 
               <div className="modal-actions">
                 <button

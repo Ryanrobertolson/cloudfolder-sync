@@ -4005,3 +4005,262 @@ fieldset.file-filter-panel {
   font-size: 12px;
   background: #f8fafc;
 }
+
+/* ==========================================================================
+   Redesigned Job Editor & Creator Modal (Modern Card Layout)
+   ========================================================================== */
+
+.job-form-modal {
+  width: min(740px, 95vw);
+  max-height: 90vh;
+  overflow-y: auto;
+  padding: 34px;
+}
+
+.job-form-header {
+  margin-bottom: 22px;
+  padding-bottom: 18px;
+  border-bottom: 1px solid #e2e8f0;
+}
+
+.job-form-header h2 {
+  margin: 2px 0 6px;
+  font-size: 22px;
+  color: #0f172a;
+}
+
+.job-editor-form {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.form-card {
+  padding: 18px;
+  border: 1px solid #e2e8f0;
+  border-radius: 12px;
+  background: #f8fafc;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.02);
+}
+
+.form-card-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.card-header-left {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.card-header-left strong {
+  display: block;
+  color: #1e293b;
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.card-header-left small {
+  display: block;
+  color: #64748b;
+  font-size: 11px;
+}
+
+.form-card-label {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.form-card-title,
+.field-label-text {
+  color: #334155;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.source-picker-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.btn-add-source {
+  padding: 6px 12px;
+  border: 1px solid #cbd5e1;
+  border-radius: 8px;
+  background: #ffffff;
+  color: #334155;
+  font-size: 11px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.btn-add-source:hover {
+  border-color: #94a3b8;
+  background: #f1f5f9;
+}
+
+.btn-add-source.primary-source {
+  background: #eff6ff;
+  border-color: #bfdbfe;
+  color: #2563eb;
+}
+
+.btn-add-source.primary-source:hover {
+  background: #dbeafe;
+  border-color: #93c5fd;
+}
+
+.selected-source-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-height: 140px;
+  overflow-y: auto;
+}
+
+.source-item-chip {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 6px 10px;
+  background: #ffffff;
+  border: 1px solid #e2e8f0;
+  border-radius: 8px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px;
+  color: #1e293b;
+}
+
+.source-item-chip strong {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.source-item-remove {
+  background: none;
+  border: none;
+  color: #94a3b8;
+  font-size: 16px;
+  cursor: pointer;
+  padding: 0 4px;
+  border-radius: 4px;
+  line-height: 1;
+}
+
+.source-item-remove:hover {
+  color: #ef4444;
+  background: #fee2e2;
+}
+
+.empty-sources-notice {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  padding: 16px;
+  border: 1px dashed #cbd5e1;
+  border-radius: 8px;
+  color: #64748b;
+  font-size: 11px;
+  background: #ffffff;
+}
+
+.form-grid-2col {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 14px;
+}
+
+@media (max-width: 640px) {
+  .form-grid-2col {
+    grid-template-columns: 1fr;
+  }
+}
+
+.field-block {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.cloud-folder-field {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 12px;
+  border: 1px solid #cbd5e1;
+  border-radius: 8px;
+  background: #ffffff;
+  cursor: pointer;
+  text-align: left;
+  transition: all 0.15s ease;
+}
+
+.cloud-folder-field:hover:not(:disabled) {
+  border-color: #3b82f6;
+  background: #f8fafc;
+}
+
+.cloud-folder-field .folder-glyph {
+  font-size: 16px;
+}
+
+.cloud-folder-field .folder-meta {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.cloud-folder-field strong {
+  color: #0f172a;
+  font-size: 12px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.cloud-folder-field small {
+  color: #64748b;
+  font-size: 10px;
+}
+
+.schedule-config-section {
+  display: flex;
+  align-items: flex-end;
+  gap: 12px;
+  margin-top: 4px;
+}
+
+.advanced-schedule-toggle {
+  background: none;
+  border: none;
+  color: #2563eb;
+  font-size: 11px;
+  font-weight: 600;
+  cursor: pointer;
+  padding: 10px 0;
+  white-space: nowrap;
+}
+
+.advanced-schedule-toggle:hover {
+  text-decoration: underline;
+}
+
+.retention-inline-block {
+  margin-top: 10px;
+  padding-top: 12px;
+  border-top: 1px solid #e2e8f0;
+}

@@ -2986,46 +2986,16 @@ nav.folder-breadcrumbs {
 }
 
 .run-list {
-  display: grid;
+  display: flex;
+  flex-direction: column;
   gap: 8px;
-  max-height: 245px;
+  max-height: 240px;
   overflow-y: auto;
 }
 
 .run-list > p {
   color: var(--muted);
   font-size: 12px;
-}
-
-.run-list article {
-  display: grid;
-  grid-template-columns: 10px 1fr;
-  gap: 10px;
-  padding: 11px;
-  border: 1px solid var(--line);
-  border-radius: 8px;
-}
-
-.run-list strong {
-  margin-right: 8px;
-  font-size: 11px;
-  text-transform: capitalize;
-}
-
-.run-list small {
-  color: var(--muted);
-  font-size: 10px;
-}
-
-.run-list p {
-  overflow: hidden;
-  margin: 5px 0 0;
-  color: #6e756f;
-  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-  font-size: 9px;
-  line-height: 1.45;
-  text-overflow: ellipsis;
-  white-space: nowrap;
 }
 
 .job-detail-actions {
@@ -3971,17 +3941,15 @@ fieldset.file-filter-panel {
 }
 
 .run-card {
-  padding: 10px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 12px 16px;
   border: 1px solid #e2e8f0;
   border-radius: 10px;
   background: #ffffff;
-  margin-bottom: 8px;
   transition: all 0.15s ease;
   box-shadow: 0 1px 2px rgba(0, 0, 0, 0.02);
-}
-
-.run-card:last-child {
-  margin-bottom: 0;
 }
 
 .run-card:hover {
@@ -3993,7 +3961,7 @@ fieldset.file-filter-panel {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  margin-bottom: 4px;
+  width: 100%;
 }
 
 .run-card-status {
@@ -4001,13 +3969,16 @@ fieldset.file-filter-panel {
   align-items: center;
   gap: 8px;
   font-size: 12px;
-  font-weight: 600;
+  font-weight: 700;
   text-transform: capitalize;
+  color: #1e293b;
 }
 
 .run-card time {
   color: #64748b;
   font-size: 11px;
+  font-weight: 500;
+  white-space: nowrap;
 }
 
 .run-card-message {
@@ -4019,6 +3990,7 @@ fieldset.file-filter-panel {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  width: 100%;
 }
 
 .run-list-empty {

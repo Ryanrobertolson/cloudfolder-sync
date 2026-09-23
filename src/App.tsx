@@ -1819,22 +1819,25 @@ export default function App() {
                               Waiting for transfer events…
                             </div>
                           ) : (
-                            jobEntries.slice(-30).map((entry) => (
-                              <div
-                                className="inline-log-row"
-                                key={entry.id}
-                                title={entry.message}
-                              >
-                                <span
-                                  className={`log-tag log-tag-${entry.state}`}
+                            jobEntries.slice(-30).map((entry) => {
+                              const cleanMessage = entry.message.replace(/\s+/g, ' ').trim();
+                              return (
+                                <div
+                                  className="inline-log-row"
+                                  key={entry.id}
+                                  title={cleanMessage}
                                 >
-                                  {entry.state}
-                                </span>
-                                <span className="log-text">
-                                  {entry.message}
-                                </span>
-                              </div>
-                            ))
+                                  <span
+                                    className={`log-tag log-tag-${entry.state}`}
+                                  >
+                                    {entry.state}
+                                  </span>
+                                  <span className="log-text">
+                                    {cleanMessage}
+                                  </span>
+                                </div>
+                              );
+                            })
                           )}
                         </div>
                       </div>
@@ -3871,7 +3874,7 @@ export default function App() {
       {selectedJob && (
         <div className="modal-backdrop" onMouseDown={() => setSelectedJob(null)}>
           <section
-            className="modal history-modal"
+            className="modal history-modal backup-details-modal"
             role="dialog"
             aria-modal="true"
             onMouseDown={(event) => event.stopPropagation()}
@@ -3879,100 +3882,149 @@ export default function App() {
             <button className="modal-close" onClick={() => setSelectedJob(null)}>
               ×
             </button>
-            <p className="eyebrow">Backup details</p>
-            <h2>{selectedJob.name}</h2>
-            <dl className="job-details">
-              <div>
-                <dt>Sources</dt>
-                <dd className="detail-source-list">
-                  {selectedJob.source_paths.map((path) => (
-                    <span key={path}>{path}</span>
-                  ))}
-                </dd>
+            <div className="details-header">
+              <div className="details-header-title">
+                <span className={`status-dot ${selectedJob.status}`} />
+                <div>
+                  <p className="eyebrow">Backup Details</p>
+                  <h2>{selectedJob.name}</h2>
+                </div>
               </div>
-              <div>
-                <dt>Destination</dt>
-                <dd>{selectedJob.destination}</dd>
+              <div className="details-header-badges">
+                <span className={`status-pill ${selectedJob.status}`}>
+                  {selectedJob.status}
+                </span>
+                <span className="details-mode-pill">
+                  {backupModeLabel(selectedJob.backup_mode)}
+                </span>
               </div>
-              <div>
-                <dt>Schedule</dt>
-                <dd>{formatInterval(selectedJob.interval_minutes)}</dd>
-              </div>
-              <div>
-                <dt>Backup type</dt>
-                <dd>{backupModeLabel(selectedJob.backup_mode)}</dd>
-              </div>
-              <div>
-                <dt>Ignore rules</dt>
-                <dd>
-                  {selectedJob.exclude_patterns?.length
-                    ? `${selectedJob.exclude_patterns.length} active`
-                    : "None — back up every file"}
-                </dd>
-              </div>
-              <div>
-                <dt>Maximum file size</dt>
-                <dd>
-                  {selectedJob.size_filter_mode === "disabled"
-                    ? "No limit for this backup"
-                    : selectedJob.size_filter_mode === "custom"
-                      ? `${selectedJob.max_file_size_mib} MiB`
-                      : appSettings.max_file_size_mib
-                        ? `${appSettings.max_file_size_mib} MiB (app default)`
-                        : "No limit (app default)"}
-                </dd>
-              </div>
-              <div>
-                <dt>File types skipped</dt>
-                <dd>
-                  {selectedJob.extension_filter_mode === "disabled"
-                    ? "None for this backup"
-                    : selectedJob.extension_filter_mode === "custom"
-                      ? selectedJob.excluded_extensions.length
-                        ? selectedJob.excluded_extensions
-                            .map((extension) => `.${extension}`)
-                            .join(", ")
-                        : "None"
-                      : appSettings.excluded_extensions.length
-                        ? `${appSettings.excluded_extensions
-                            .map((extension) => `.${extension}`)
-                            .join(", ")} (app default)`
-                        : "None (app default)"}
-                </dd>
-              </div>
-              <div>
-                <dt>Previous files</dt>
-                <dd>
-                  {selectedJob.backup_mode === "incremental" ||
-                  selectedJob.backup_mode === "mirror"
-                    ? selectedJob.retention_count > 0
-                      ? `Keep ${selectedJob.retention_count} backup runs`
-                      : "Turned off"
-                    : "Stored in dated backup folders"}
-                </dd>
-              </div>
-              <div>
-                <dt>Next run</dt>
-                <dd>{formatTime(selectedJob.next_run_at)}</dd>
-              </div>
-            </dl>
-            <h3>Recent activity</h3>
-            <div className="run-list">
-              {runs.length === 0 ? (
-                <p>No runs yet.</p>
-              ) : (
-                runs.map((run) => (
-                  <article key={run.id}>
-                    <span className={`status-dot ${run.status}`} />
-                    <div>
-                      <strong>{run.status}</strong>
-                      <small>{formatTime(run.finished_at)}</small>
-                      <p>{run.message}</p>
-                    </div>
-                  </article>
-                ))
-              )}
             </div>
+
+            <div className="details-grid">
+              <div className="details-card">
+                <div className="details-card-header">
+                  <span className="card-icon">📁</span>
+                  <strong>Source Folders ({selectedJob.source_paths.length})</strong>
+                </div>
+                <div className="detail-source-list">
+                  {selectedJob.source_paths.map((path) => (
+                    <div className="source-path-item" key={path} title={path}>
+                      <span className="source-path-text">{path}</span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+
+              <div className="details-card">
+                <div className="details-card-header">
+                  <span className="card-icon">☁️</span>
+                  <strong>Destination & Schedule</strong>
+                </div>
+                <div className="detail-info-rows">
+                  <div className="detail-info-row">
+                    <span>Destination</span>
+                    <strong className="mono" title={selectedJob.destination}>{selectedJob.destination}</strong>
+                  </div>
+                  <div className="detail-info-row">
+                    <span>Schedule</span>
+                    <strong>{formatInterval(selectedJob.interval_minutes)}</strong>
+                  </div>
+                  <div className="detail-info-row">
+                    <span>Next run</span>
+                    <strong>{formatTime(selectedJob.next_run_at)}</strong>
+                  </div>
+                  <div className="detail-info-row">
+                    <span>Safety history</span>
+                    <strong>
+                      {selectedJob.backup_mode === "incremental" ||
+                      selectedJob.backup_mode === "mirror"
+                        ? selectedJob.retention_count > 0
+                          ? `Keep ${selectedJob.retention_count} snapshots`
+                          : "Turned off"
+                        : "Dated folders"}
+                    </strong>
+                  </div>
+                </div>
+              </div>
+
+              <div className="details-card details-card-full">
+                <div className="details-card-header">
+                  <span className="card-icon">🛡️</span>
+                  <strong>File Rules & Filters</strong>
+                </div>
+                <div className="details-filter-pills">
+                  <div className="filter-pill-item">
+                    <span>Ignore rules:</span>
+                    <strong>
+                      {selectedJob.exclude_patterns?.length
+                        ? `${selectedJob.exclude_patterns.length} active`
+                        : "None (all files)"}
+                    </strong>
+                  </div>
+                  <div className="filter-pill-item">
+                    <span>Max size:</span>
+                    <strong>
+                      {selectedJob.size_filter_mode === "disabled"
+                        ? "No limit"
+                        : selectedJob.size_filter_mode === "custom"
+                          ? `${selectedJob.max_file_size_mib} MiB`
+                          : appSettings.max_file_size_mib
+                            ? `${appSettings.max_file_size_mib} MiB`
+                            : "No limit"}
+                    </strong>
+                  </div>
+                  <div className="filter-pill-item">
+                    <span>Skipped extensions:</span>
+                    <strong>
+                      {selectedJob.extension_filter_mode === "disabled"
+                        ? "None"
+                        : selectedJob.extension_filter_mode === "custom"
+                          ? selectedJob.excluded_extensions.length
+                            ? selectedJob.excluded_extensions
+                                .map((ext) => `.${ext}`)
+                                .join(", ")
+                            : "None"
+                          : appSettings.excluded_extensions.length
+                            ? appSettings.excluded_extensions
+                                .map((ext) => `.${ext}`)
+                                .join(", ")
+                            : "None"}
+                    </strong>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <div className="details-recent-section">
+              <div className="details-section-heading">
+                <h3>Recent Run History</h3>
+                <small>{runs.length} recorded {runs.length === 1 ? "run" : "runs"}</small>
+              </div>
+              <div className="run-list">
+                {runs.length === 0 ? (
+                  <div className="run-list-empty">
+                    <span>⏳</span>
+                    <p>No backup runs recorded yet.</p>
+                  </div>
+                ) : (
+                  runs.slice(0, 5).map((run) => (
+                    <article className={`run-card run-card-${run.status}`} key={run.id}>
+                      <div className="run-card-header">
+                        <div className="run-card-status">
+                          <span className={`status-dot ${run.status}`} />
+                          <strong>{run.status}</strong>
+                        </div>
+                        <time>{formatTime(run.finished_at ?? run.started_at)}</time>
+                      </div>
+                      <p className="run-card-message" title={run.message}>
+                        {run.message}
+                      </p>
+                    </article>
+                  ))
+                )}
+              </div>
+            </div>
+
             <div className="job-detail-actions">
               <div className="job-detail-safe-actions">
                 <button
@@ -4003,9 +4055,8 @@ export default function App() {
                   className="danger"
                   onClick={() => void removeJob(selectedJob)}
                 >
-                  Remove backup job
+                  Delete backup
                 </button>
-                <small>Cloud files will remain there.</small>
               </div>
             </div>
           </section>
